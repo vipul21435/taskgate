@@ -214,6 +214,17 @@ passes the same review gates before it is accepted.
     after it" (Docker rejects the file too), and TG302 still checks the pins
     instead of skipping, so the author sees both problems in one run.
 
+- **Review fixes, runner (2026-09-30):**
+  - `execute()` ignores `ESRCH` and `EPERM` from the `killpg` after the timeout
+    hook: when the process exits during `docker kill`, its group is gone or holds
+    only a zombie, and macOS answers `EPERM`, which used to surface as "cannot
+    run docker: [Errno 1]". A run that passed its deadline stays a timeout even
+    if it exited during the hook.
+  - Tests now pin a task's own `environment.workdir` reaching `docker run
+    --workdir` (and the `/workspace` fallback for a relative value), and the
+    Docker runner's created-file listing leaving out cache files; both
+    mutations from the review now fail the suite.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license

@@ -24,6 +24,7 @@ surrounding repository. The Docker runner lives in :mod:`taskgate.docker_runner`
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import shlex
@@ -219,7 +220,11 @@ def execute(
     """Run ``cmd`` in its own process group; on timeout call ``on_timeout``, then kill the group.
 
     With ``merge_stderr`` stderr is folded into stdout (in order); otherwise it is
-    returned separately. Output is decoded as UTF-8 with replacement.
+    returned separately. Output is decoded as UTF-8 with replacement. A run that
+    passed its deadline is reported as timed out (``code`` ``None``) even when it
+    exits while ``on_timeout`` runs: the group is then gone or holds only an
+    unreaped zombie, which ``killpg`` answers with ``ESRCH`` or (on macOS)
+    ``EPERM``, and neither means anything is left to kill.
     """
     proc = subprocess.Popen(
         cmd,
@@ -237,7 +242,8 @@ def execute(
     except subprocess.TimeoutExpired:
         if on_timeout is not None:
             on_timeout()
-        os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(proc.pid, signal.SIGKILL)
         out, err = proc.communicate()
         code = None
     return Completed(

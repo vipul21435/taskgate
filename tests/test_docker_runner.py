@@ -253,6 +253,60 @@ def test_a_slow_solution_is_killed_with_its_container(
     assert fake_docker.calls("kill") == [["kill", flag(run_argv, "--name")]]
 
 
+def test_a_run_that_exits_while_its_container_is_killed_is_still_a_timeout(
+    tmp_path: Path, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If ``docker run`` exits during ``docker kill``, macOS answers ``killpg`` with EPERM;
+    the run is reported as a timeout, not as 'cannot run docker'."""
+    task = make_task(tmp_path / "echo", solve="sleep 30\n")
+    runner = DockerRunner()
+    runner.build(task)
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    result = runner.run(task, solution="reference", timeout_sec=1.5)
+    assert (result.timed_out, result.error) == (True, None)
+
+
+def test_the_task_workdir_is_the_containers_workdir(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    task = make_task(tmp_path / "echo")
+    manifest = task / "task.toml"
+    text = manifest.read_text(encoding="utf-8")
+    manifest.write_text(text.replace('"/workspace"', '"/home/agent/task"'), encoding="utf-8")
+    DockerRunner().run(task, solution="none", timeout_sec=60)
+    manifest.write_text(text.replace('"/workspace"', '"relative/dir"'), encoding="utf-8")
+    DockerRunner().run(task, solution="none", timeout_sec=60)
+    assert [flag(argv, "--workdir") for argv in fake_docker.calls("run")] == [
+        "/home/agent/task",
+        "/workspace",
+    ]
+
+
+def test_created_files_in_a_container_leave_out_seeded_changed_and_cache_files(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    solve = (
+        "echo changed > input/name.txt\n"
+        "mkdir -p out/deep __pycache__ pkg/.pytest_cache\n"
+        "echo x > out/deep/a.txt\n"
+        "echo y > b.txt\n"
+        "echo z > __pycache__/c.pyc\n"
+        "echo z > mod.pyc\n"
+        "echo z > .DS_Store\n"
+        "echo z > pkg/.pytest_cache/v\n"
+    )
+    grader = "def test_ok() -> None:\n    pass\n"
+    task = make_task(tmp_path / "echo", solve=solve, grader=grader)
+    result = DockerRunner().run(task, solution="reference", timeout_sec=60)
+    assert result.created == ("b.txt", "out/deep/a.txt")
+
+
 def test_a_container_killed_before_any_output_is_an_error(
     tmp_path: Path, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
 ) -> None:

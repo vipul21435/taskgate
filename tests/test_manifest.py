@@ -128,3 +128,15 @@ def test_load_marks_missing_and_unparsable_manifests_as_not_parsed(tmp_path: Pat
     check = load(tmp_path)
     assert check.parsed
     assert check.declared_timeout_sec is None
+
+
+@pytest.mark.parametrize(
+    ("workdir", "expected"),
+    [("/srv/task", "/srv/task"), ("relative/dir", "/workspace"), (7, "/workspace")],
+)
+def test_workdir_is_the_manifests_absolute_path_or_the_default(
+    workdir: object, expected: str
+) -> None:
+    assert validate(with_env(workdir=workdir), "demo").workdir == expected
+    missing = {**VALID, "environment": {"dockerfile": "Dockerfile"}}
+    assert validate(missing, "demo").workdir == "/workspace"

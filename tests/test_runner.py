@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -167,6 +169,28 @@ def test_execute_calls_the_timeout_hook_before_killing() -> None:
     done = execute(["sleep", "30"], timeout=0.2, on_timeout=lambda: called.append(True))
     assert done.code is None
     assert called == [True]
+
+
+def test_a_run_that_ends_while_the_timeout_hook_runs_is_a_timeout() -> None:
+    """The process exits during ``on_timeout``; on macOS ``killpg`` on its zombie-only
+    group then fails with EPERM, which used to escape as an OSError."""
+    done = execute(["sh", "-c", "sleep 0.3"], timeout=0.2, on_timeout=lambda: time.sleep(0.5))
+    assert done.code is None
+
+
+@pytest.mark.parametrize("error", [PermissionError, ProcessLookupError])
+def test_a_group_that_cannot_be_signalled_at_the_deadline_is_a_timeout(
+    monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+) -> None:
+    real_killpg = os.killpg
+
+    def killpg(pgid: int, sig: int) -> None:
+        real_killpg(pgid, sig)
+        raise error(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", killpg)
+    done = execute(["sleep", "30"], timeout=0.2)
+    assert done.code is None
 
 
 def test_tool_caches_are_not_copied_into_a_run(tmp_path: Path, runner: LocalRunner) -> None:
