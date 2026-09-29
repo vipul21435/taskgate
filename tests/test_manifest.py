@@ -3,7 +3,7 @@ from typing import Any
 
 import pytest
 
-from taskgate.manifest import DEFAULT_TIMEOUT_SEC, Manifest, load, validate
+from taskgate.manifest import DEFAULT_TIMEOUT_SEC, Manifest, load, unknown_keys, validate
 
 VALID: dict[str, Any] = {
     "task": {"id": "demo", "title": "Demo", "difficulty": "easy", "timeout_sec": 30},
@@ -96,3 +96,35 @@ def test_load_reports_missing_and_unparsable_manifests(tmp_path: Path) -> None:
     (tmp_path / "task.toml").write_text("[task\n", encoding="utf-8")
     (problem,) = load(tmp_path).problems
     assert problem.startswith("task.toml does not parse:")
+
+
+def test_known_keys_only() -> None:
+    assert unknown_keys(VALID) == []
+    assert validate(VALID, "demo").parsed
+
+
+@pytest.mark.parametrize(
+    ("raw", "found"),
+    [
+        (with_task(titel="x"), ["task.titel (did you mean task.title?)"]),
+        (with_env(work_dir="/w"), ["environment.work_dir (did you mean environment.workdir?)"]),
+        (with_env(timeout_sec=5), ["environment.timeout_sec (did you mean task.timeout_sec?)"]),
+        ({**VALID, "difficulty": "easy"}, ["difficulty (did you mean task.difficulty?)"]),
+        ({**VALID, "taks": {}}, ["[taks] (did you mean [task]?)"]),
+        ({**VALID, "metadata": {"a": 1}}, ["[metadata]"]),
+        ({**VALID, "author": "me"}, ["author"]),
+        ({**VALID, "task": "not a table"}, []),
+    ],
+)
+def test_unknown_keys(raw: dict[str, Any], found: list[str]) -> None:
+    assert unknown_keys(raw) == found
+
+
+def test_load_marks_missing_and_unparsable_manifests_as_not_parsed(tmp_path: Path) -> None:
+    assert not load(tmp_path).parsed
+    (tmp_path / "task.toml").write_text("[task\n", encoding="utf-8")
+    assert not load(tmp_path).parsed
+    (tmp_path / "task.toml").write_text("[task]\n", encoding="utf-8")
+    check = load(tmp_path)
+    assert check.parsed
+    assert check.declared_timeout_sec is None

@@ -73,6 +73,10 @@ class TaskReport:
         return "fail" if self.blocking_failures else "pass"
 
 
+OptionValue = int | float | tuple[str, ...]
+"""The value of one option in a ``taskgate.toml`` section such as ``[manifest]``."""
+
+
 @dataclass(frozen=True, slots=True)
 class ConfigSummary:
     """What ``taskgate.toml`` changed, as reports show it."""
@@ -83,6 +87,9 @@ class ConfigSummary:
     disabled: tuple[str, ...] = ()
     severity: tuple[tuple[str, Severity], ...] = ()
     """``(code, severity)`` pairs that override a gate's default severity."""
+
+    options: tuple[tuple[str, OptionValue], ...] = ()
+    """``(section.key, value)`` for every gate option that differs from its default."""
 
 
 @dataclass(frozen=True, slots=True)

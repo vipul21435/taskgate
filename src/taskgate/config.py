@@ -8,6 +8,10 @@
     [gates.severity]
     TG203 = "warning"            # error | warning | info
 
+    [manifest]                   # TG104
+    min_timeout_sec = 10
+    max_timeout_sec = 1800
+
 Validation collects every problem before failing, and unknown sections, keys and
 gate codes are errors rather than silently ignored. In diff mode the file is read
 from the base ref, not from the pull request, so a pull request cannot relax the
@@ -19,11 +23,12 @@ from __future__ import annotations
 import re
 import tomllib
 from collections.abc import Collection, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from taskgate.results import ConfigSummary, Severity
+from taskgate.manifest import TIMEOUT_RANGE
+from taskgate.results import ConfigSummary, OptionValue, Severity
 
 CONFIG_FILE = "taskgate.toml"
 CODE = re.compile(r"^TG[1-9][0-9]{2}$")
@@ -35,6 +40,28 @@ class ConfigError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class ManifestOptions:
+    """TG104: the recommended ``task.timeout_sec`` range (TG102 enforces 1..3600)."""
+
+    min_timeout_sec: int = 10
+    max_timeout_sec: int = 1800
+
+
+OptionSection = ManifestOptions
+"""The dataclasses behind the option sections (``[manifest]``)."""
+
+
+def _overrides(name: str, options: OptionSection) -> list[tuple[str, OptionValue]]:
+    """``(section.key, value)`` for every option that differs from its default."""
+    default = type(options)()
+    return [
+        (f"{name}.{f.name}", getattr(options, f.name))
+        for f in fields(options)
+        if getattr(options, f.name) != getattr(default, f.name)
+    ]
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """The effective configuration; the defaults apply when no file exists."""
 
@@ -43,6 +70,7 @@ class Config:
 
     disabled: frozenset[str] = frozenset()
     severity: Mapping[str, Severity] = field(default_factory=dict)
+    manifest: ManifestOptions = ManifestOptions()
 
     def severity_for(self, code: str, default: Severity) -> Severity:
         return self.severity.get(code, default)
@@ -61,6 +89,7 @@ class Config:
             source=self.source,
             disabled=tuple(sorted(self.disabled)),
             severity=tuple(sorted(self.severity.items())),
+            options=tuple(_overrides("manifest", self.manifest)),
         )
 
 
@@ -75,6 +104,31 @@ class _Problems(list[str]):
     def unknown(self, table: Mapping[str, Any], allowed: Collection[str], where: str) -> None:
         for key in sorted(set(table) - set(allowed)):
             self.append(f"unknown key {where}{key}" if where else f"unknown section [{key}]")
+
+    def section(self, raw: Mapping[str, Any], name: str, keys: Collection[str]) -> _Section:
+        """The ``[name]`` table, with its unknown keys reported."""
+        table = self.table(raw, name, f"[{name}]")
+        self.unknown(table, keys, f"{name}.")
+        return _Section(name, table, self)
+
+
+@dataclass(frozen=True, slots=True)
+class _Section:
+    """Typed reads from one table; a bad value is reported and replaced by its default."""
+
+    name: str
+    table: dict[str, Any]
+    problems: _Problems
+
+    def integer(self, key: str, default: int, low: int, high: int) -> int:
+        value = self.table.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool):
+            self.problems.append(f"{self.name}.{key} must be an integer")
+        elif not low <= value <= high:
+            self.problems.append(f"{self.name}.{key} {value} is outside {low}..{high}")
+        else:
+            return value
+        return default
 
 
 def _codes(value: object, where: str, problems: _Problems) -> frozenset[str]:
@@ -99,17 +153,29 @@ def _severities(table: Mapping[str, Any], problems: _Problems) -> dict[str, Seve
     return result
 
 
+def _manifest(raw: Mapping[str, Any], problems: _Problems) -> ManifestOptions:
+    section = problems.section(raw, "manifest", ("min_timeout_sec", "max_timeout_sec"))
+    default = ManifestOptions()
+    before = len(problems)
+    low = section.integer("min_timeout_sec", default.min_timeout_sec, *TIMEOUT_RANGE)
+    high = section.integer("max_timeout_sec", default.max_timeout_sec, *TIMEOUT_RANGE)
+    if len(problems) == before and low > high:
+        problems.append(f"manifest.min_timeout_sec {low} is above max_timeout_sec {high}")
+    return ManifestOptions(min_timeout_sec=low, max_timeout_sec=high)
+
+
 def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     """Validate a parsed ``taskgate.toml``; raise :class:`ConfigError` listing every problem."""
     problems = _Problems()
-    problems.unknown(raw, ("gates",), "")
+    problems.unknown(raw, ("gates", "manifest"), "")
     gates = problems.table(raw, "gates", "[gates]")
     problems.unknown(gates, ("disable", "severity"), "gates.")
     disabled = _codes(gates.get("disable", []), "gates.disable", problems)
     severity = _severities(problems.table(gates, "severity", "gates.severity"), problems)
+    manifest = _manifest(raw, problems)
     if problems:
         raise ConfigError(f"invalid {source}:\n  " + "\n  ".join(problems))
-    return Config(source=source, disabled=disabled, severity=severity)
+    return Config(source=source, disabled=disabled, severity=severity, manifest=manifest)
 
 
 def parse(text: str, source: str) -> Config:

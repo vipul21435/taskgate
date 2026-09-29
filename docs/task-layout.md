@@ -64,8 +64,20 @@ workdir = "/workspace"
 Gate TG102 validates the manifest: both tables present, `id` kebab-case and equal
 to the directory name, a non-empty `title`, `difficulty` one of the three values,
 `timeout_sec` an integer in 1..3600, and `workdir` an absolute path. Every problem
-is reported at once. Unknown keys are not flagged yet (see [PLAN.md](../PLAN.md),
-slice 1).
+is reported at once.
+
+The keys above are the whole schema. Gate TG103 flags any other table or key as a
+likely typo and names the closest known one (`task.timout_sec (did you mean
+task.timeout_sec?)`, `[enviroment] (did you mean [environment]?)`); a known key
+in the wrong place (`timeout_sec` above `[task]`) is pointed at where it belongs.
+Gate TG104 warns when `timeout_sec` is valid but outside the recommended range,
+10..1800 s by default (`[manifest]` in `taskgate.toml`).
+
+## Instruction
+
+`instruction.md` is the prompt the agent receives. Gate TG105 fails when it is not
+UTF-8 or has no text once HTML comments and Markdown headings are removed (a
+template left with only `# Title` and `<!-- TODO -->` is empty).
 
 ## Gates (implemented)
 
@@ -73,8 +85,12 @@ slice 1).
 | --- | --- | --- | --- |
 | TG101 | layout-complete | yes | the parts above exist, including `solution/solve.sh` and a `tests/test_*.py` (or `*_test.py`) file |
 | TG102 | manifest-valid | yes | `task.toml` matches the schema above |
+| TG103 | manifest-known-keys | no (warning) | `task.toml` has no tables or keys outside the schema (skipped when it does not parse) |
+| TG104 | timeout-in-range | no (warning) | `timeout_sec` is inside the recommended range (skipped when it is invalid) |
+| TG105 | instruction-not-empty | yes | `instruction.md` is UTF-8 and has text beyond headings and comments (skipped when missing) |
 | TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
 | TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
 
 A gate whose requirement did not pass is reported as `skip`, not as a second
-failure.
+failure. `taskgate gates` prints the current list with each gate's effective
+severity; `taskgate.toml` can disable a gate or change its severity.

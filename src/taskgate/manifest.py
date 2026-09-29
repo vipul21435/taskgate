@@ -7,6 +7,7 @@ author everything that needs fixing.
 
 from __future__ import annotations
 
+import difflib
 import re
 import tomllib
 from dataclasses import dataclass
@@ -17,6 +18,11 @@ DIFFICULTIES: tuple[str, ...] = ("easy", "medium", "hard")
 TIMEOUT_RANGE: tuple[int, int] = (1, 3600)
 DEFAULT_TIMEOUT_SEC = 120
 TASK_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+SCHEMA: dict[str, tuple[str, ...]] = {
+    "task": ("id", "title", "difficulty", "timeout_sec"),
+    "environment": ("dockerfile", "workdir"),
+}
+"""Every table and key a manifest may hold; anything else is flagged by TG103."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,13 +46,22 @@ class ManifestCheck:
     raw: dict[str, Any]
     """The parsed TOML document (empty when it did not parse)."""
 
+    parsed: bool = True
+    """False when ``task.toml`` is missing or is not valid TOML."""
+
     @property
-    def timeout_sec(self) -> int:
-        """The task's time budget, or the default when the manifest does not give a valid one."""
+    def declared_timeout_sec(self) -> int | None:
+        """``task.timeout_sec`` when it is an integer in the allowed range, else ``None``."""
         timeout = _as_int(_table(self.raw, "task").get("timeout_sec"))
         if timeout is not None and TIMEOUT_RANGE[0] <= timeout <= TIMEOUT_RANGE[1]:
             return timeout
-        return DEFAULT_TIMEOUT_SEC
+        return None
+
+    @property
+    def timeout_sec(self) -> int:
+        """The task's time budget, or the default when the manifest does not give a valid one."""
+        declared = self.declared_timeout_sec
+        return DEFAULT_TIMEOUT_SEC if declared is None else declared
 
 
 def _table(raw: dict[str, Any], key: str) -> dict[str, Any]:
@@ -120,13 +135,54 @@ def validate(raw: dict[str, Any], task_dir_name: str) -> ManifestCheck:
     return ManifestCheck(manifest=manifest, problems=tuple(problems), raw=raw)
 
 
+def _hint(name: str, candidates: dict[str, str]) -> str:
+    """`` (did you mean X?)`` for the closest candidate, or nothing when none is close."""
+    match = difflib.get_close_matches(name, list(candidates), n=1, cutoff=0.6)
+    return f" (did you mean {candidates[match[0]]}?)" if match else ""
+
+
+def _key_candidates(table: str | None) -> dict[str, str]:
+    """Every known key, shown qualified; keys of ``table`` win over same-named ones elsewhere."""
+    candidates: dict[str, str] = {}
+    for owner in sorted(SCHEMA, key=lambda name: name != table):
+        for key in SCHEMA[owner]:
+            candidates.setdefault(key, f"{owner}.{key}")
+    return candidates
+
+
+def unknown_keys(raw: dict[str, Any]) -> list[str]:
+    """Tables and keys outside :data:`SCHEMA`, in file order, each with a did-you-mean hint.
+
+    Hints are qualified names: a misspelt table suggests ``[task]``, a misspelt
+    key suggests ``task.timeout_sec``, and a known key in the wrong place
+    (``timeout_sec`` above ``[task]``, or inside ``[environment]``) suggests
+    where it belongs.
+    """
+    tables = {name: f"[{name}]" for name in SCHEMA}
+    found: list[str] = []
+    for name, value in raw.items():
+        if name in SCHEMA and isinstance(value, dict):
+            candidates = _key_candidates(name)
+            found.extend(
+                f"{name}.{key}{_hint(key, candidates)}" for key in value if key not in SCHEMA[name]
+            )
+        elif name not in SCHEMA:
+            if isinstance(value, dict):
+                found.append(f"[{name}]{_hint(name, tables)}")
+            else:
+                found.append(f"{name}{_hint(name, _key_candidates(None))}")
+    return found
+
+
 def load(task_dir: Path) -> ManifestCheck:
     """Read and validate ``task_dir/task.toml``."""
     path = task_dir / "task.toml"
     try:
         raw = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return ManifestCheck(manifest=None, problems=("task.toml not found",), raw={})
+        return ManifestCheck(manifest=None, problems=("task.toml not found",), raw={}, parsed=False)
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
-        return ManifestCheck(manifest=None, problems=(f"task.toml does not parse: {exc}",), raw={})
+        return ManifestCheck(
+            manifest=None, problems=(f"task.toml does not parse: {exc}",), raw={}, parsed=False
+        )
     return validate(raw, task_dir.name)

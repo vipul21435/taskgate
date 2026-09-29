@@ -47,12 +47,8 @@ def test_builtin_gates_follow_the_protocol_and_run_in_code_order() -> None:
 
 def test_good_task_passes_every_gate(tmp_path: Path) -> None:
     results = run_gates(make_task(tmp_path / "echo"))
-    assert [(r.code, r.status) for r in results] == [
-        ("TG101", Status.PASS),
-        ("TG102", Status.PASS),
-        ("TG401", Status.PASS),
-        ("TG402", Status.PASS),
-    ]
+    assert [r.code for r in results] == [g.code for g in BUILTIN_GATES]
+    assert {r.status for r in results} == {Status.PASS}
     assert all(r.fix_hint is None and not r.blocking for r in results)
     assert by_code(results)["TG401"].message == "reference solution passes the grader (1 passed)"
     assert by_code(results)["TG402"].message == "an untouched workspace fails the grader (1 failed)"

@@ -19,8 +19,9 @@ from taskgate.gates.base import (
     is_binary,
 )
 from taskgate.gates.core import CORE_GATES, missing_layout
+from taskgate.gates.lint import LINT_GATES
 
-BUILTIN_GATES: tuple[Gate, ...] = tuple(sorted(CORE_GATES, key=lambda g: g.code))
+BUILTIN_GATES: tuple[Gate, ...] = tuple(sorted((*CORE_GATES, *LINT_GATES), key=lambda g: g.code))
 """Every gate TaskGate ships with, in code order (the order they run in)."""
 
 __all__ = [

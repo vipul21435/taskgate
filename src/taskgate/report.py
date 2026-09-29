@@ -9,7 +9,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from taskgate.results import CheckReport, ConfigSummary, GateResult, Status, TaskReport
+from taskgate.results import (
+    CheckReport,
+    ConfigSummary,
+    GateResult,
+    OptionValue,
+    Status,
+    TaskReport,
+)
 
 SHORT_SHA = 7
 
@@ -41,7 +48,18 @@ def describe_config(config: ConfigSummary) -> str | None:
     if config.severity:
         overrides = ", ".join(f"{code}={severity.value}" for code, severity in config.severity)
         parts.append(f"severity {overrides}")
+    if config.options:
+        options = ", ".join(f"{key}={_option_text(value)}" for key, value in config.options)
+        parts.append(f"options {options}")
     return "; ".join(parts)
+
+
+def _option_text(value: OptionValue) -> str:
+    return json.dumps(list(value)) if isinstance(value, tuple) else str(value)
+
+
+def _option_json(value: OptionValue) -> int | float | list[str]:
+    return list(value) if isinstance(value, tuple) else value
 
 
 def _result_line(report: CheckReport) -> str:
@@ -170,6 +188,7 @@ def to_dict(report: CheckReport) -> dict[str, Any]:
             "source": report.config.source,
             "disabled": list(report.config.disabled),
             "severity": {code: severity.value for code, severity in report.config.severity},
+            "options": {key: _option_json(value) for key, value in report.config.options},
         },
     }
 

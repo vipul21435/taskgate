@@ -272,7 +272,7 @@ def test_diff_mode_takes_the_config_from_the_base_not_the_pull_request(repo: Git
     blocked = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--format", "json"])
     assert blocked.exit_code == 1
     data = json.loads(blocked.stdout)
-    assert data["config"] == {"source": None, "disabled": [], "severity": {}}
+    assert data["config"] == {"source": None, "disabled": [], "severity": {}, "options": {}}
     assert data["other_files"] == ["taskgate.toml"]
 
     repo.checkout("main")
@@ -286,6 +286,7 @@ def test_diff_mode_takes_the_config_from_the_base_not_the_pull_request(repo: Git
         "source": "taskgate.toml at main",
         "disabled": [],
         "severity": {"TG402": "warning"},
+        "options": {},
     }
 
 
@@ -301,7 +302,9 @@ def test_explicit_config_disables_gates_and_skips_their_dependents(
     assert result.exit_code == 0, result.output
     assert f"config: {config}; disabled TG101; severity TG402=warning" in result.stdout
     assert "  TG101  " not in result.stdout
-    assert "skip  TG401  solution-passes  skipped: requires TG101 (disabled) to pass" in (
+    skipped = [line.split() for line in result.stdout.splitlines() if "(disabled)" in line]
+    assert [words[:2] for words in skipped] == [["skip", "TG401"], ["skip", "TG402"]]
+    assert "skip  TG401  solution-passes        skipped: requires TG101 (disabled) to pass" in (
         result.stdout
     )
 

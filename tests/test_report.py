@@ -114,6 +114,22 @@ def test_config_is_named_in_every_format() -> None:
         "source": "taskgate.toml at main",
         "disabled": ["TG104", "TG203"],
         "severity": {},
+        "options": {},
+    }
+
+
+def test_non_default_options_are_named_in_every_format() -> None:
+    config = ConfigSummary(
+        source="taskgate.toml",
+        options=(("manifest.max_timeout_sec", 900), ("secrets.exclude", ("data/*",))),
+    )
+    report = CheckReport(version="9.9.9", mode="all", config=config)
+    described = 'taskgate.toml; options manifest.max_timeout_sec=900, secrets.exclude=["data/*"]'
+    assert describe_config(config) == described
+    assert to_text(report).splitlines()[1] == f"config: {described}"
+    assert to_dict(report)["config"]["options"] == {
+        "manifest.max_timeout_sec": 900,
+        "secrets.exclude": ["data/*"],
     }
 
 
