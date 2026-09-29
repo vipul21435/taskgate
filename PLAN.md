@@ -76,6 +76,34 @@ passes the same review gates before it is accepted.
   (manifest lint, secret scan, file-size limits) are still to do. An interrupted
   agent's untested draft of them was stashed locally ("wip from interrupted
   agent"), not committed.
+- **Static gates (2026-09-30, slice 1 done):**
+  - The stashed draft was reviewed, not applied blindly. Kept: `unknown_keys`,
+    `ManifestCheck.parsed`/`declared_timeout_sec`, the lint gates, the scanner's
+    known-format list and the typed `[section]` readers. Changed: hints name the
+    qualified key (`task.timeout_sec`, `[environment]`) and point a known key in
+    the wrong table to where it belongs; `[secrets] allow` is stored as strings
+    (validated at parse time, compiled once per scan) so the config stays plain
+    data for the future cache key; the scan streams files line by line instead of
+    reading them whole; TG105 was renamed `instruction-not-empty` and reads
+    `utf-8-sig`. The stash is now superseded and can be dropped.
+  - The draft claimed its class-transition rule kept CamelCase identifiers out;
+    it did not (`PyUnicode_AsLatin1String` was flagged, 49 hits in the installed
+    site-packages outside RECORD files, 2809 with them). Added a word rule
+    (fewer than 15% of neighbouring pairs among the 50 commonest English
+    bigrams) and blanking of `sha256=`/`sha512-` digests: 0 findings on 689,539
+    lines, at a recall cost of 89% / 97% / 97% / 99.75% on seeded 24/32/40/64
+    character base64 tokens (`examples/secret_survey.py`).
+  - Severities: TG103 and TG104 warn (a typo or a long timeout is suspicious,
+    not wrong); TG105, TG201, TG202 and TG203 block. Binary files block unless
+    `[files] binary_allow` lists them, and since the config is read from the
+    base ref, accepting a binary is a maintainer decision, not the author's.
+  - Globs use `fnmatch.fnmatchcase` on task-relative POSIX paths (`*` crosses
+    `/`), for both `[secrets] exclude` and `[files] binary_allow`.
+  - Reports list every option that differs from its default
+    (`ConfigSummary.options`, JSON `config.options`), so a relaxed limit is
+    visible in the pull-request comment.
+  - Test fixtures assemble fake tokens at runtime so no token literal is pushed;
+    the demo's planted key is a random string with no known format.
 
 ## Scaffold (done)
 
@@ -109,7 +137,8 @@ passes the same review gates before it is accepted.
 
 ## Slices
 
-- [ ] **1. Gate plugin registry and static gates.** A `Gate` protocol and
+- [x] **1. Gate plugin registry and static gates.** Done 2026-09-30: 10 built-in
+  gates, 216 tests, 100% branch coverage, CI green. A `Gate` protocol and
   registry with stable codes, severities and fix hints; third-party gates via the
   `taskgate.gates` entry-point group; `taskgate gates` lists every code; a
   `taskgate.toml` config to disable gates or override severities. Static gates:
