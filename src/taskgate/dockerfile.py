@@ -1,18 +1,22 @@
 """Read a task's Dockerfile: locate it, parse it, and check it without Docker.
 
-The parser follows the Dockerfile rules that matter for review: parser
-directives (``# escape=``), comment lines, line continuations (also across
-comment and blank lines), heredocs (``RUN <<EOF`` ... ``EOF``, so a heredoc
-body is never taken for an instruction), and case-insensitive keywords.
+The parser follows the Dockerfile rules that matter for review: a leading
+UTF-8 byte order mark is dropped, lines end only at ``\n`` (a ``\r`` before it
+is dropped too), parser directives (``# escape=``), comment lines, line
+continuations (also across comment and blank lines), heredocs (``RUN <<EOF``
+... ``EOF``, so a heredoc body is never taken for an instruction), and
+case-insensitive keywords.
 
-:func:`external_images` lists the images a build pulls (``FROM`` and
-``COPY --from=``), with global ``ARG`` defaults substituted, leaving out
-``scratch`` and earlier build stages; gate TG302 requires each to be pinned by
-digest. :func:`static_problems` is the part of gate TG301 that needs no Docker.
+:func:`external_images` lists the images a build pulls (``FROM``,
+``COPY --from=``/``ADD --from=`` and the ``from=`` of a ``RUN --mount``), with
+global ``ARG`` defaults substituted (a default may use earlier ones), leaving
+out ``scratch`` and earlier build stages; gate TG302 requires each to be pinned
+by digest. :func:`static_problems` is the part of gate TG301 that needs no Docker.
 """
 
 from __future__ import annotations
 
+import csv
 import json
 import posixpath
 import re
@@ -49,6 +53,9 @@ DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 VARIABLE = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::([-+])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))"
 )
+FLAG = re.compile(r"--(\S*)\s*")
+KEYWORD_SPLIT = re.compile(r"[\t\v\f\r ]+")
+"""What separates an instruction's keyword from its arguments (as in Docker's parser)."""
 GLOB_CHARS = frozenset("*?[")
 ROOT_USERS = frozenset({"root", "0"})
 LISTED = 5
@@ -72,7 +79,7 @@ class ImageRef:
 
     line: int
     instruction: str
-    """``FROM`` or ``COPY --from`` (or ``ADD --from``)."""
+    """``FROM``, ``COPY --from``, ``ADD --from`` or ``RUN --mount from``."""
 
     written: str
     resolved: str | None
@@ -115,7 +122,7 @@ def read(env_dir: Path, name: str) -> tuple[Instruction, ...] | str:
     if isinstance(located, str):
         return located
     try:
-        return parse(located.read_text(encoding="utf-8"))
+        return parse(located.read_bytes().decode("utf-8"))
     except UnicodeDecodeError:
         return f"environment/{name} is not UTF-8"
 
@@ -124,9 +131,23 @@ def _is_comment(line: str) -> bool:
     return line.lstrip().startswith("#")
 
 
+def split_lines(text: str) -> list[str]:
+    """``text`` split into lines the way Docker reads a Dockerfile.
+
+    A leading byte order mark is dropped and lines end at ``\n`` only, with one
+    ``\r`` before it removed; form feeds, ``\x85``, U+2028 and the other
+    characters :meth:`str.splitlines` also breaks at stay inside their line.
+    """
+    return [line.removesuffix("\r") for line in text.removeprefix("\ufeff").split("\n")]
+
+
 def parse(text: str) -> tuple[Instruction, ...]:
-    """Split a Dockerfile into instructions (see the module docstring for the rules)."""
-    lines = text.splitlines()
+    """Split a Dockerfile into instructions (see the module docstring for the rules).
+
+    A logical line that holds nothing but line continuations becomes an
+    instruction with an empty keyword (Docker rejects it; TG301 reports it).
+    """
+    lines = split_lines(text)
     escape = "\\"
     index = 0
     while index < len(lines) and (directive := DIRECTIVE.match(lines[index])):
@@ -148,7 +169,7 @@ def parse(text: str) -> tuple[Instruction, ...]:
             current = lines[index].rstrip() if index < len(lines) else ""
             index += 1
         parts.append(current)
-        keyword, *rest = "".join(parts).split(None, 1)
+        keyword, *rest = KEYWORD_SPLIT.split("".join(parts).strip(), maxsplit=1)
         keyword = keyword.upper()
         args = rest[0] if rest else ""
         if keyword in HEREDOC_INSTRUCTIONS:
@@ -191,29 +212,51 @@ def _words(text: str) -> list[str]:
         return text.split()
 
 
-def _arg_defaults(args: str) -> dict[str, str | None]:
-    """``ARG A=1 B`` -> ``{"A": "1", "B": None}``."""
-    values: dict[str, str | None] = {}
+def _declare_args(args: str, values: dict[str, str | None]) -> None:
+    """Add ``ARG A=1 B=${A}x C`` to ``values`` in order: ``A=1``, ``B=1x``, ``C`` unset.
+
+    A default may use the ``ARG``s declared before it, as in Docker; a default
+    that uses a variable with no value is itself treated as having no value.
+    """
     for word in _words(args):
         name, equals, value = word.partition("=")
-        values[name] = value if equals else None
-    return values
+        values[name] = _substitute(value, values) if equals else None
+
+
+def _flag_items(args: str) -> tuple[list[tuple[str, str]], str]:
+    """Leading ``--name=value`` flags in order (names lower-cased) and the rest."""
+    items: list[tuple[str, str]] = []
+    rest = args
+    while match := FLAG.match(rest):
+        name, _, value = match.group(1).partition("=")
+        items.append((name.lower(), value))
+        rest = rest[match.end() :]
+    return items, rest
 
 
 def _flags(args: str) -> tuple[dict[str, str], str]:
-    """Leading ``--name=value`` flags and the rest of the arguments."""
-    flags: dict[str, str] = {}
-    rest = args
-    while rest.startswith("--"):
-        flag, _, rest = rest.partition(" ")
-        name, _, value = flag[2:].partition("=")
-        flags[name.lower()] = value
-        rest = rest.lstrip()
-    return flags, rest
+    """Leading ``--name=value`` flags (the last one of a name wins) and the rest."""
+    items, rest = _flag_items(args)
+    return dict(items), rest
+
+
+def _mount_sources(args: str) -> list[str]:
+    """The ``from=`` value of each ``RUN --mount`` (a CSV list of ``key=value`` fields)."""
+    items, _ = _flag_items(args)
+    sources: list[str] = []
+    for name, value in items:
+        if name != "mount":
+            continue
+        for field in next(csv.reader([value]), []):
+            key, equals, source = field.strip().partition("=")
+            if equals and key.strip().lower() == "from" and source:
+                sources.append(source)
+    return sources
 
 
 def external_images(instructions: tuple[Instruction, ...]) -> list[ImageRef]:
-    """Images pulled by ``FROM`` and ``COPY/ADD --from``, minus ``scratch`` and build stages."""
+    """Images pulled by ``FROM``, ``COPY/ADD --from`` and ``RUN --mount=from=``, minus
+    ``scratch`` and build stages."""
     global_args: dict[str, str | None] = {}
     stages: list[str] = []
     refs: list[ImageRef] = []
@@ -228,7 +271,7 @@ def external_images(instructions: tuple[Instruction, ...]) -> list[ImageRef]:
 
     for ins in instructions:
         if ins.keyword == "ARG" and not seen_from:
-            global_args.update(_arg_defaults(ins.args))
+            _declare_args(ins.args, global_args)
         elif ins.keyword == "FROM":
             seen_from = True
             _, rest = _flags(ins.args)
@@ -242,6 +285,9 @@ def external_images(instructions: tuple[Instruction, ...]) -> list[ImageRef]:
             flags, _ = _flags(ins.args)
             if flags.get("from"):
                 external(ins.line, f"{ins.keyword} --from", flags["from"])
+        elif ins.keyword == "RUN":
+            for source in _mount_sources(ins.args):
+                external(ins.line, "RUN --mount from", source)
     return refs
 
 
@@ -318,12 +364,14 @@ def static_problems(env_dir: Path, name: str) -> list[str]:
         return [instructions]
     problems = [
         f"line {ins.line}: unknown instruction {ins.keyword}"
+        if ins.keyword
+        else f"line {ins.line}: a line continuation with no instruction after it"
         for ins in instructions
         if ins.keyword not in KNOWN_INSTRUCTIONS
     ]
     if not any(ins.keyword == "FROM" for ins in instructions):
         return [*problems, f"environment/{name} has no FROM instruction"]
-    first = next(ins for ins in instructions if ins.keyword != "ARG")
+    first = next(ins for ins in instructions if ins.keyword not in ("ARG", ""))
     if first.keyword != "FROM":
         problems.append(f"line {first.line}: {first.keyword} comes before the first FROM")
     copies_workspace = False

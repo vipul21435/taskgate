@@ -196,6 +196,24 @@ passes the same review gates before it is accepted.
     module-level cache; only TG501 blocks it, and its flips are identical on
     macOS, in the image and on the CI runner.
 
+- **Review fixes, Dockerfile reader (2026-09-30):**
+  - TG302 now lists the `from=` of every `RUN --mount` (CSV fields, any mount
+    type; stage names and stage numbers exempt, like `COPY --from`), since
+    BuildKit resolves it like a base image. A `# syntax=` frontend and `ONBUILD`
+    pulls are still not listed (README, Known issues).
+  - A global `ARG` default is expanded with the `ARG`s before it, in order, as
+    Docker does for meta args; a default that uses a variable with no value has
+    no value itself, so the existing "a variable in it has no default" rule
+    still applies.
+  - Lines are split the way Docker's parser does: a leading BOM is dropped and
+    only `\n` ends a line (one `\r` before it is dropped); `str.splitlines()`
+    broke at form feeds and U+2028. The keyword is split off at
+    `[\t\v\f\r ]+` like Docker's `splitCommand`.
+  - A logical line with nothing but continuations becomes an instruction with
+    an empty keyword: TG301 reports "a line continuation with no instruction
+    after it" (Docker rejects the file too), and TG302 still checks the pins
+    instead of skipping, so the author sees both problems in one run.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license

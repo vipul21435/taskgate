@@ -1,5 +1,6 @@
 """Environment gates: the Dockerfile is sound and builds (TG301), and every image
-it pulls is pinned by digest (TG302).
+it names for the build to pull (``FROM``, ``COPY/ADD --from``, ``RUN --mount``
+``from=``) is pinned by digest (TG302).
 
 TG301 always runs the static checks in :func:`taskgate.dockerfile.static_problems`.
 With the Docker runner it also builds the image (tagged by the build context's
@@ -44,7 +45,7 @@ def environment_builds(ctx: TaskContext) -> Check:
     "TG302",
     "base-images-pinned",
     severity=Severity.ERROR,
-    summary="every FROM (and COPY --from) image is pinned by sha256 digest",
+    summary="every image the build pulls (FROM, COPY --from, RUN --mount from=) is digest-pinned",
     fix_hint=(
         "Pin each image by digest, e.g. FROM python:3.12-slim@sha256:<digest> "
         "(docker buildx imagetools inspect python:3.12-slim prints it); scratch and "

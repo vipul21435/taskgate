@@ -40,7 +40,7 @@ answer should be) is the most common way a task goes wrong.
   | TG202 | file-size-limits | error | every file is under 1 MiB and the task under 10 MiB (`[files]`) |
   | TG203 | no-binary-files | error | every binary file (NUL in the first 8000 bytes) matches a `[files] binary_allow` glob |
   | TG301 | environment-builds | error | the Dockerfile passes static checks (known instructions, `FROM` first, every `COPY` source present, non-root `USER`, `workspace/` copied in) and, on the Docker runner, builds |
-  | TG302 | base-images-pinned | error | every `FROM` and `COPY --from` image ends in `@sha256:<digest>` after `ARG` defaults are substituted (`scratch` and build stages exempt) |
+  | TG302 | base-images-pinned | error | every `FROM`, `COPY --from` and `RUN --mount` `from=` image ends in `@sha256:<digest>` after `ARG` defaults are substituted (`scratch` and build stages exempt) |
   | TG401 | solution-passes | error | `solve.sh` exits 0 and the pytest grader then passes (needs TG101 and a built environment) |
   | TG402 | baseline-fails | error | the grader fails on the untouched workspace and collects at least one test (needs TG101 and a built environment) |
   | TG403 | stub-solution-fails | error | the grader fails after a stub `solve.sh` that creates every file the reference solution created, empty (needs TG401) |
@@ -100,9 +100,12 @@ answer should be) is the most common way a task goes wrong.
   (killing the whole process group on timeout), and never writes into the task's
   source tree. On this runner TG301 does the static checks only and says the
   image was not built.
-- **A Dockerfile reader** (`dockerfile.py`) that handles parser directives
-  (`# escape=`), continuations across comment lines, heredocs and global `ARG`
-  substitution (`$V`, `${V}`, `${V:-x}`, `${V:+x}`), used by TG301 and TG302.
+- **A Dockerfile reader** (`dockerfile.py`) that reads lines as Docker does (a
+  leading byte order mark dropped, lines split at `\n` only), and handles parser
+  directives (`# escape=`), continuations across comment lines, heredocs and
+  global `ARG` substitution (`$V`, `${V}`, `${V:-x}`, `${V:+x}`, defaults that
+  use earlier `ARG`s), used by TG301 and TG302. The images it lists for TG302
+  include the `from=` of `RUN --mount`, which BuildKit pulls like a base image.
 - **Reports**: text on stdout (or `--format markdown|json`), plus `report.md` and
   `report.json` under `--out DIR`. Exit codes: 0 no blocking failure, 1 blocking
   failure, 2 usage error (not a git repository, unknown base ref, invalid
@@ -409,7 +412,7 @@ TG2xx  hygiene
   TG203  error    no-binary-files        no binary files unless [files] binary_allow lists them
 TG3xx  environment
   TG301  error    environment-builds     environment/Dockerfile passes the static checks and builds (Docker runner)
-  TG302  error    base-images-pinned     every FROM (and COPY --from) image is pinned by sha256 digest
+  TG302  error    base-images-pinned     every image the build pulls (FROM, COPY --from, RUN --mount from=) is digest-pinned
 TG4xx  solution and baselines
   TG401  error    solution-passes        the reference solution passes the grader in a fresh workspace
   TG402  error    baseline-fails         the grader fails when no solution has run (untouched workspace)
@@ -578,6 +581,9 @@ flowchart LR
   failure with the container's output.
 - TG301's static checks cannot see a `USER` inherited from the base image, so a
   Dockerfile must set `USER` in its final stage even when the base already does.
+- TG302 does not list the frontend image a `# syntax=` directive names or images
+  that a base image's `ONBUILD` triggers pull, and it substitutes only global
+  `ARG` defaults (not `ARG`s declared inside a stage).
 - Task images accumulate under `taskgate-env:*`; nothing prunes them
   automatically (`make clean-images` removes them all).
 - The TaskGate image has no Docker CLI, so `taskgate check` inside it always

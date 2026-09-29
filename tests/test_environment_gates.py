@@ -102,6 +102,67 @@ def test_pinned_unpinned_and_stage_only_images(tmp_path: Path) -> None:
     )
 
 
+def test_tg302_blocks_an_unpinned_run_mount_image(tmp_path: Path) -> None:
+    dockerfile = (
+        f"FROM {BASE_IMAGE}\n"
+        "RUN --mount=from=ghcr.io/astral-sh/uv,source=/uv,target=/bin/uv uv --version\n"
+        "COPY workspace/ /workspace/\n"
+        "USER 1000\n"
+    )
+    result = gates(make_task(tmp_path / "echo", dockerfile=dockerfile), "TG302")["TG302"]
+    assert (result.status, result.message) == (
+        Status.FAIL,
+        "1 image is not pinned by digest: line 2: RUN --mount from ghcr.io/astral-sh/uv",
+    )
+
+
+def test_tg302_accepts_a_digest_from_a_nested_arg_default(tmp_path: Path) -> None:
+    name, digest = BASE_IMAGE.split("@")
+    dockerfile = (
+        f"ARG DIGEST={digest}\n"
+        f"ARG IMAGE={name}@${{DIGEST}}\n"
+        "FROM ${IMAGE}\n"
+        "COPY workspace/ /workspace/\n"
+        "USER 1000\n"
+    )
+    results = gates(make_task(tmp_path / "echo", dockerfile=dockerfile), "TG301", "TG302")
+    assert (results["TG302"].status, results["TG302"].message) == (
+        Status.PASS,
+        "1 image pinned by sha256 digest",
+    )
+    assert results["TG301"].status is Status.PASS
+
+
+def test_a_bom_does_not_hide_the_base_image(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    dockerfile = task / "environment" / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8").replace(BASE_IMAGE, "python:3.12-slim")
+    dockerfile.write_bytes(b"\xef\xbb\xbf" + text.encode())
+    results = gates(task, "TG301", "TG302")
+    assert results["TG301"].status is Status.PASS
+    assert (results["TG302"].status, results["TG302"].message) == (
+        Status.FAIL,
+        "1 image is not pinned by digest: line 1: FROM python:3.12-slim",
+    )
+
+
+def test_a_lone_line_continuation_fails_tg301_and_tg302_still_checks_pins(
+    tmp_path: Path,
+) -> None:
+    task = make_task(tmp_path / "echo")
+    dockerfile = task / "environment" / "Dockerfile"
+    dockerfile.write_text(dockerfile.read_text(encoding="utf-8") + "\\\n", encoding="utf-8")
+    results = gates(task, "TG301", "TG302")
+    assert (results["TG301"].status, results["TG301"].message) == (
+        Status.FAIL,
+        "line 8: a line continuation with no instruction after it",
+    )
+    assert (results["TG302"].status, results["TG302"].message) == (
+        Status.PASS,
+        "1 image pinned by sha256 digest",
+    )
+
+
 def test_stub_gate_passes_a_grader_that_checks_content(tmp_path: Path) -> None:
     result = gates(make_task(tmp_path / "echo"), "TG403")["TG403"]
     assert (result.status, result.message) == (

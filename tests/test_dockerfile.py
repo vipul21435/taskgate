@@ -9,10 +9,14 @@ from taskgate.dockerfile import (
     external_images,
     listed,
     parse,
+    read,
     static_problems,
 )
 
 PIN = "@sha256:" + "a" * 64
+BOM = chr(0xFEFF)
+LS = chr(0x2028)
+"""U+2028 LINE SEPARATOR, a line break for str.splitlines() but not for Docker."""
 
 
 def keywords(text: str) -> list[tuple[int, str, str]]:
@@ -217,3 +221,90 @@ def test_unterminated_heredocs_and_unbalanced_quotes_do_not_crash() -> None:
         (2, "RUN", "<<EOF"),
     ]
     assert refs("ARG B='x\nFROM alpine:$B\n") == [(2, "FROM", "alpine:$B", "alpine:'x", False)]
+
+
+def test_run_mount_from_images_are_listed() -> None:
+    text = (
+        f"FROM python:3.12-slim{PIN} AS build\n"
+        "RUN --mount=from=ghcr.io/astral-sh/uv,source=/uv,target=/bin/uv uv --version\n"
+        "RUN --network=none --mount=type=bind,from=alpine:3.20,source=/bin/busybox,target=/bb"
+        " --mount=type=cache,target=/root/.cache /bb true\n"
+        f'RUN --mount=type=bind,"from=busybox{PIN}",target=/b true\n'
+        "RUN --mount=type=cache,from=build,target=/c --mount=type=bind,from=0,target=/d true\n"
+        "RUN --mount=type=secret,id=token cat /run/secrets/token\n"
+        "RUN echo --mount=from=not-a-flag\n"
+        "USER 1000\n"
+    )
+    assert refs(text) == [
+        (1, "FROM", f"python:3.12-slim{PIN}", f"python:3.12-slim{PIN}", True),
+        (2, "RUN --mount from", "ghcr.io/astral-sh/uv", "ghcr.io/astral-sh/uv", False),
+        (3, "RUN --mount from", "alpine:3.20", "alpine:3.20", False),
+        (4, "RUN --mount from", f"busybox{PIN}", f"busybox{PIN}", True),
+    ]
+    (mount,) = [ref for ref in external_images(parse(text)) if ref.line == 2]
+    assert mount.describe() == "line 2: RUN --mount from ghcr.io/astral-sh/uv"
+
+
+def test_arg_defaults_may_use_earlier_args() -> None:
+    digest = PIN.removeprefix("@")
+    text = (
+        f"ARG DIGEST={digest}\n"
+        "ARG IMAGE=python:3.12-slim@${DIGEST}\n"
+        "ARG A=alpine B=${A}:3.20 C=${UNSET}x\n"
+        "FROM ${IMAGE}\n"
+        "FROM ${B}\n"
+        "FROM ${C}\n"
+    )
+    assert refs(text) == [
+        (4, "FROM", "${IMAGE}", f"python:3.12-slim{PIN}", True),
+        (5, "FROM", "${B}", "alpine:3.20", False),
+        (6, "FROM", "${C}", None, False),
+    ]
+
+
+def test_lines_split_like_docker_a_bom_and_crlf_are_dropped() -> None:
+    assert keywords(BOM + "FROM scratch\r\nUSER 1\r\n") == [
+        (1, "FROM", "scratch"),
+        (2, "USER", "1"),
+    ]
+    assert keywords('FROM scratch\nLABEL description="page one\x0cpage two"\nUSER 1\n') == [
+        (1, "FROM", "scratch"),
+        (2, "LABEL", 'description="page one\x0cpage two"'),
+        (3, "USER", "1"),
+    ]
+    assert keywords("FROM scratch\nLABEL a=b" + LS + "c\x85d\rUSER 0\nUSER 1\n") == [
+        (1, "FROM", "scratch"),
+        (2, "LABEL", "a=b" + LS + "c\x85d\rUSER 0"),
+        (3, "USER", "1"),
+    ]
+    assert keywords(BOM + "# escape=`\nFROM alpine\nRUN a `\n b\n") == [
+        (2, "FROM", "alpine"),
+        (3, "RUN", "a  b"),
+    ]
+
+
+def test_a_bom_prefixed_dockerfile_is_read_like_any_other(tmp_path: Path) -> None:
+    env = write_env(tmp_path, "")
+    (env / "Dockerfile").write_bytes(b"\xef\xbb\xbfFROM python:3.12-slim\nUSER 1000\n")
+    assert static_problems(env, "Dockerfile") == []
+    instructions = read(env, "Dockerfile")
+    assert not isinstance(instructions, str)
+    assert [ref.describe() for ref in external_images(instructions)] == [
+        "line 1: FROM python:3.12-slim"
+    ]
+
+
+def test_a_lone_line_continuation_is_a_problem_not_a_crash(tmp_path: Path) -> None:
+    assert keywords("FROM scratch\nUSER 1\n\\\n") == [
+        (1, "FROM", "scratch"),
+        (2, "USER", "1"),
+        (3, "", ""),
+    ]
+    assert keywords("FROM scratch\n  \\  \n\n# note\n") == [(1, "FROM", "scratch"), (2, "", "")]
+    assert refs("FROM alpine\n\\\n") == [(1, "FROM", "alpine", "alpine", False)]
+    env = write_env(tmp_path, "\\\nARG X=1\nFROM alpine\nUSER 1\n\\\n# trailing comment\n")
+    assert static_problems(env, "Dockerfile") == [
+        "line 5: a line continuation with no instruction after it"
+    ]
+    env.joinpath("Dockerfile").write_text("\\\n\nFROM alpine\nUSER 1\n", encoding="utf-8")
+    assert static_problems(env, "Dockerfile") == []

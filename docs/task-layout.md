@@ -130,10 +130,17 @@ inside `environment/`. Gate TG301 checks it without Docker on either runner:
 - when `environment/workspace/` exists, some `COPY`/`ADD` copies it (or `.`) in.
 
 On the Docker runner TG301 also builds the image, and a failed build is reported
-with the last line of the build log. Gate TG302 lists every image the build
-pulls, `FROM` and `COPY --from=`, after substituting global `ARG` defaults, and
-requires each to end in `@sha256:<64 hex>`; `scratch` and earlier build stages
-need no digest, and a variable with no default counts as unpinned.
+with the last line of the build log. Gate TG302 lists every image the
+Dockerfile names for the build to pull: `FROM`, `COPY --from=` and `ADD --from=`,
+and the `from=` of each `RUN --mount`, after substituting global `ARG` defaults
+(a default may use the `ARG`s before it), and requires each to end in
+`@sha256:<64 hex>`; `scratch` and earlier build stages need no digest, and a
+variable with no default counts as unpinned. Images that a base image's
+`ONBUILD` triggers or a `# syntax=` frontend pull are not listed.
+
+Both gates read the Dockerfile as Docker does: a leading UTF-8 byte order mark
+is dropped, and lines end only at `\n` (with an optional `\r` before it), so a
+form feed or U+2028 inside a value does not start a new instruction.
 
 ## Manifest
 
@@ -220,7 +227,7 @@ matches `/` (`tests/data/*` covers every file below `tests/data/`).
 | TG202 | file-size-limits | yes | every file and the whole task are under the size limits |
 | TG203 | no-binary-files | yes | every binary file matches a `[files] binary_allow` glob |
 | TG301 | environment-builds | yes | the Dockerfile passes the checks under "Environment", and builds on the Docker runner (skipped without `environment/`) |
-| TG302 | base-images-pinned | yes | every `FROM` and `COPY --from` image is pinned by sha256 digest (skipped without a Dockerfile) |
+| TG302 | base-images-pinned | yes | every `FROM`, `COPY --from` and `RUN --mount` `from=` image is pinned by sha256 digest (skipped without a Dockerfile) |
 | TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
 | TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
 | TG403 | stub-solution-fails | yes | the grader fails after a stub that creates the reference solution's new files, empty (requires TG401) |
