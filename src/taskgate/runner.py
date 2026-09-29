@@ -8,6 +8,12 @@ one :data:`Solution` followed by the grader. There are three kinds of solution:
 - a :class:`Stub`: a generated ``solve.sh`` that creates the files the reference
   solution created, empty, and does nothing else (TG403).
 
+``regrade`` runs the reference solution once and then the grader once per seed
+on an identical copy of its output (TG501). Each rerun loads the bundled
+:mod:`taskgate.shuffle_plugin` to shuffle the test order with the seed, sets
+``PYTHONHASHSEED`` and ``TASKGATE_SEED`` to the seed, and writes pytest's JUnit
+XML, so per-test outcomes can be compared across reruns.
+
 :class:`LocalRunner` follows the runtime contract in ``docs/task-layout.md``
 without Docker: it copies ``environment/workspace/`` into a fresh temporary
 workspace, runs ``solve.sh`` there with ``sh``, then runs ``python -m pytest`` on
@@ -27,11 +33,12 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
+from taskgate import shuffle_plugin
 from taskgate.files import ignore_caches, regular_files
 
 OUTPUT_TAIL_LINES = 20
@@ -39,6 +46,12 @@ PYTEST_NO_TESTS = 5
 PYTEST_ARGS: tuple[str, ...] = ("-m", "pytest", "-q", "-p", "no:cacheprovider")
 """Grader arguments after the interpreter; ``--rootdir``, ``-c`` and the tests dir follow."""
 SOLUTION_ENTRY = "solve.sh"
+PLUGIN_MODULE = "taskgate_shuffle"
+"""The name :mod:`taskgate.shuffle_plugin` is copied under for a rerun (``-p`` loads it)."""
+PLUGIN_DIR = "plugin"
+JUNIT_FILE = "junit.xml"
+MAX_JUNIT_BYTES = 8 << 20
+"""JUnit XML beyond this size is not read (a rerun with it reports no outcomes)."""
 _DURATION = re.compile(r"\s+in\s+\d+(?:\.\d+)?s\b.*$")
 
 
@@ -119,6 +132,35 @@ class BuildResult:
     """The last lines of the build log (on failure)."""
 
 
+@dataclass(frozen=True, slots=True)
+class GraderRun:
+    """One rerun of the grader with a seed (see :meth:`Runner.regrade`)."""
+
+    seed: int
+    exit: int | None
+    """pytest's exit code; ``None`` when the run did not finish within the budget."""
+
+    junit: str
+    """The JUnit XML pytest wrote (``""`` when it wrote none or it was too big)."""
+
+    output: str
+    """pytest's combined stdout and stderr, in full."""
+
+
+@dataclass(frozen=True, slots=True)
+class Regrade:
+    """The reference solution run once, then the grader once per seed on its output."""
+
+    solution: RunResult
+    """The solution step (its grader fields are unset); reruns happen only after exit 0."""
+
+    runs: tuple[GraderRun, ...] = ()
+    """One per seed, in order; shorter than the seeds when the budget ran out."""
+
+    error: str | None = None
+    """Set when the runner failed between reruns (could not restore the workspace, ...)."""
+
+
 class Runner(Protocol):
     """Anything that can prepare a task's environment and run a solution plus the grader."""
 
@@ -130,6 +172,11 @@ class Runner(Protocol):
     def build(self, task_dir: Path) -> BuildResult: ...
 
     def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult: ...
+
+    def regrade(self, task_dir: Path, *, seeds: Sequence[int], timeout_sec: float) -> Regrade:
+        """Run the reference solution, then the grader once per seed on a fresh copy of
+        its output; the whole call has ``(len(seeds) + 1) * timeout_sec`` seconds."""
+        ...
 
 
 def tail(text: str) -> str:
@@ -205,6 +252,45 @@ def grader_argv(python: str, root: str) -> list[str]:
     return [python, *PYTEST_ARGS, "--rootdir", root, "-c", f"{root}/pytest.ini", f"{root}/tests"]
 
 
+def regrade_args(seed: str, junit: str) -> list[str]:
+    """Extra grader arguments for a rerun: the shuffle plugin with ``seed``, JUnit XML.
+
+    ``xunit1`` keeps each test's ``file`` attribute, from which the report rebuilds
+    pytest's own test ids (``tests/test_x.py::test_y``).
+    """
+    return [
+        "-p",
+        PLUGIN_MODULE,
+        shuffle_plugin.OPTION,
+        seed,
+        "--junitxml",
+        junit,
+        "-o",
+        "junit_family=xunit1",
+    ]
+
+
+def plugin_source() -> bytes:
+    """The shuffle plugin's source, as it is copied into every rerun."""
+    return Path(shuffle_plugin.__file__).read_bytes()
+
+
+def seeded_env(env: dict[str, str], seed: int, plugin_dir: Path) -> dict[str, str]:
+    """``env`` with the rerun's seeds set and the plugin directory first on ``PYTHONPATH``."""
+    path = os.pathsep.join(part for part in (str(plugin_dir), env.get("PYTHONPATH", "")) if part)
+    return {**env, "PYTHONHASHSEED": str(seed), "TASKGATE_SEED": str(seed), "PYTHONPATH": path}
+
+
+def read_junit(path: Path) -> str:
+    """The JUnit XML at ``path``; ``""`` when it is missing or larger than the cap."""
+    try:
+        if path.stat().st_size > MAX_JUNIT_BYTES:
+            return ""
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
 def stage_solution(task_dir: Path, solution: Stub | Literal["reference"], dest: Path) -> None:
     """Write what runs as ``dest/solve.sh`` (and its siblings) for ``solution``."""
     if isinstance(solution, Stub):
@@ -232,20 +318,25 @@ class LocalRunner:
     def build(self, task_dir: Path) -> BuildResult:
         return BuildResult(ok=True, message="not built: the local runner does not use Docker")
 
+    @staticmethod
+    def _stage(task_dir: Path, root: Path) -> Path:
+        """Copy the workspace seed and tests under ``root``; return the workspace."""
+        workspace = root / "workspace"
+        seed = task_dir / "environment" / "workspace"
+        if seed.is_dir():
+            shutil.copytree(seed, workspace, ignore=ignore_caches, symlinks=True)
+        else:
+            workspace.mkdir()
+        shutil.copytree(task_dir / "tests", root / "tests", ignore=ignore_caches, symlinks=True)
+        (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+        return workspace
+
     def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
         deadline = time.monotonic() + timeout_sec
         env = _child_env()
         with tempfile.TemporaryDirectory(prefix="taskgate-") as tmp:
             root = Path(tmp)
-            workspace = root / "workspace"
-            seed = task_dir / "environment" / "workspace"
-            if seed.is_dir():
-                shutil.copytree(seed, workspace, ignore=ignore_caches, symlinks=True)
-            else:
-                workspace.mkdir()
-            shutil.copytree(task_dir / "tests", root / "tests", ignore=ignore_caches, symlinks=True)
-            (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
-
+            workspace = self._stage(task_dir, root)
             solution_exit: int | None = None
             created: tuple[str, ...] = ()
             if solution != "none":
@@ -277,3 +368,47 @@ class LocalRunner:
                 output=tail(graded.stdout),
                 created=created,
             )
+
+    def regrade(self, task_dir: Path, *, seeds: Sequence[int], timeout_sec: float) -> Regrade:
+        deadline = time.monotonic() + timeout_sec * (len(seeds) + 1)
+        env = _child_env()
+        with tempfile.TemporaryDirectory(prefix="taskgate-") as tmp:
+            root = Path(tmp)
+            workspace = self._stage(task_dir, root)
+            stage_solution(task_dir, "reference", root / "solution")
+            done = execute(
+                ["sh", str(root / "solution" / SOLUTION_ENTRY)],
+                cwd=workspace,
+                env=env,
+                timeout=deadline - time.monotonic(),
+            )
+            if done.code != 0:
+                timed_out = done.code is None
+                return Regrade(RunResult(done.code, None, timed_out, output=tail(done.stdout)))
+            solved = RunResult(0, None, timed_out=False, output="")
+            snapshot = root / "solved"
+            shutil.copytree(workspace, snapshot, symlinks=True)
+            plugin = root / PLUGIN_DIR
+            plugin.mkdir()
+            (plugin / f"{PLUGIN_MODULE}.py").write_bytes(plugin_source())
+            junit = root / JUNIT_FILE
+            runs: list[GraderRun] = []
+            for index, seed in enumerate(seeds):
+                if index:
+                    try:
+                        shutil.rmtree(workspace)
+                        shutil.copytree(snapshot, workspace, symlinks=True)
+                    except OSError as exc:
+                        error = f"could not restore the workspace before rerun {index + 1}: {exc}"
+                        return Regrade(solved, tuple(runs), error=error)
+                junit.unlink(missing_ok=True)
+                graded = execute(
+                    [*grader_argv(self.python, str(root)), *regrade_args(str(seed), str(junit))],
+                    cwd=workspace,
+                    env=seeded_env(env, seed, plugin),
+                    timeout=deadline - time.monotonic(),
+                )
+                runs.append(GraderRun(seed, graded.code, read_junit(junit), graded.stdout))
+                if graded.code is None:
+                    break
+            return Regrade(solved, tuple(runs))

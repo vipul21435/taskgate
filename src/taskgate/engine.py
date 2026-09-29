@@ -36,11 +36,12 @@ def run_gates(
     config: Config | None = None,
     runner: Runner | None = None,
     tracked: Sequence[str] | None = None,
+    label: str | None = None,
 ) -> tuple[GateResult, ...]:
     """Run the enabled ``gates`` in order on ``task_dir``; one result per gate that ran.
 
     ``tracked`` lists the task's files as git tracks them (diff mode); see
-    :attr:`TaskContext.files`.
+    :attr:`TaskContext.files`. ``label`` is the task's path as reports show it.
     """
     config = config or Config()
     ctx = TaskContext(
@@ -48,6 +49,7 @@ def run_gates(
         runner=runner or LocalRunner(),
         config=config,
         tracked=None if tracked is None else tuple(tracked),
+        label=label,
     )
     status: dict[str, Status] = {}
     results: list[GateResult] = []
@@ -71,6 +73,7 @@ def run_gates(
             status=outcome.status,
             message=outcome.message,
             fix_hint=gate.fix_hint if outcome.status is Status.FAIL else None,
+            details=outcome.details,
         )
         status[gate.code] = result.status
         results.append(result)

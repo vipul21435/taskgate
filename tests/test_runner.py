@@ -2,8 +2,17 @@ from pathlib import Path
 
 import pytest
 
-from taskfactory import LENIENT_GRADER, make_task
-from taskgate.runner import LocalRunner, RunResult, Stub, execute
+from taskfactory import LENIENT_GRADER, ORDER_DEPENDENT_GRADER, make_task
+from taskgate.determinism import parse_junit
+from taskgate.runner import (
+    MAX_JUNIT_BYTES,
+    LocalRunner,
+    RunResult,
+    Stub,
+    execute,
+    read_junit,
+    seeded_env,
+)
 
 
 @pytest.fixture
@@ -177,3 +186,104 @@ def test_tool_caches_are_not_copied_into_a_run(tmp_path: Path, runner: LocalRunn
     (workspace / "notes.txt").write_text("kept\n", encoding="utf-8")
     result = runner.run(task, solution="none", timeout_sec=60)
     assert result.grader_passed, result.output
+
+
+SEED_GRADER = """\
+import os
+import random
+from pathlib import Path
+
+
+def test_seeds_are_set() -> None:
+    seed = os.environ["TASKGATE_SEED"]
+    assert os.environ["PYTHONHASHSEED"] == seed
+    assert random.random() == random.Random(int(seed)).random()
+
+
+def test_each_rerun_starts_from_the_solved_workspace() -> None:
+    assert Path("output/greeting.txt").read_text(encoding="utf-8") == "world\\n"
+    marker = Path("output/graded.marker")
+    assert not marker.exists()
+    marker.write_text("x", encoding="utf-8")
+"""
+"""Passes only when the seeds are set, ``random`` is seeded with the run's seed and
+every rerun gets a fresh copy of the solved workspace."""
+
+
+def test_regrade_runs_the_solution_once_and_the_grader_per_seed(
+    tmp_path: Path, runner: LocalRunner
+) -> None:
+    task = make_task(tmp_path / "echo", grader=SEED_GRADER)
+    regraded = runner.regrade(task, seeds=(7, 8, 9), timeout_sec=60)
+    assert regraded.solution.solution_exit == 0
+    assert regraded.error is None
+    assert [(run.seed, run.exit) for run in regraded.runs] == [(7, 0), (8, 0), (9, 0)]
+    for run in regraded.runs:
+        assert set(parse_junit(run.junit).values()) == {"passed"}, run.output
+
+
+def test_regrade_shuffles_the_test_order_by_seed(tmp_path: Path, runner: LocalRunner) -> None:
+    task = make_task(tmp_path / "echo", grader=ORDER_DEPENDENT_GRADER)
+    regraded = runner.regrade(task, seeds=(4, 5), timeout_sec=60)
+    orders = [list(parse_junit(run.junit)) for run in regraded.runs]
+    assert orders == [
+        [
+            "tests/test_outputs.py::test_greeting_matches",
+            "tests/test_outputs.py::test_output_is_read",
+        ],
+        [
+            "tests/test_outputs.py::test_output_is_read",
+            "tests/test_outputs.py::test_greeting_matches",
+        ],
+    ]
+    assert [run.exit for run in regraded.runs] == [1, 0]
+
+
+def test_regrade_stops_at_a_failing_solution(tmp_path: Path, runner: LocalRunner) -> None:
+    task = make_task(tmp_path / "echo", solve="echo broken\nexit 3\n")
+    regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=60)
+    assert (regraded.solution.solution_exit, regraded.solution.output) == (3, "broken")
+    assert regraded.runs == ()
+
+
+def test_regrade_stops_when_the_budget_runs_out(tmp_path: Path, runner: LocalRunner) -> None:
+    grader = "import time\n\ndef test_slow() -> None:\n    time.sleep(30)\n"
+    task = make_task(tmp_path / "echo", grader=grader)
+    regraded = runner.regrade(task, seeds=(1, 2, 3), timeout_sec=0.5)
+    assert [(run.seed, run.exit, run.junit) for run in regraded.runs] == [(1, None, "")]
+
+
+def test_regrade_reports_a_workspace_it_cannot_restore(tmp_path: Path, runner: LocalRunner) -> None:
+    grader = (
+        "from pathlib import Path\n\n"
+        "def test_locks_a_directory() -> None:\n"
+        "    Path('locked').mkdir(exist_ok=True)\n"
+        "    Path('locked/file').write_text('x')\n"
+        "    Path('locked').chmod(0o500)\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=60)
+    assert [run.exit for run in regraded.runs] == [0]
+    assert regraded.error is not None
+    assert regraded.error.startswith("could not restore the workspace before rerun 2: ")
+
+
+def test_read_junit_skips_missing_and_oversized_files(tmp_path: Path) -> None:
+    path = tmp_path / "junit.xml"
+    assert read_junit(path) == ""
+    path.write_text("<testsuite/>", encoding="utf-8")
+    assert read_junit(path) == "<testsuite/>"
+    with path.open("wb") as handle:
+        handle.truncate(MAX_JUNIT_BYTES + 1)
+    assert read_junit(path) == ""
+
+
+def test_seeded_env_puts_the_plugin_first_on_pythonpath(tmp_path: Path) -> None:
+    env = seeded_env({"PYTHONPATH": "/x", "A": "b"}, 3, tmp_path)
+    assert env == {
+        "A": "b",
+        "PYTHONHASHSEED": "3",
+        "TASKGATE_SEED": "3",
+        "PYTHONPATH": f"{tmp_path}:/x",
+    }
+    assert seeded_env({}, 0, tmp_path)["PYTHONPATH"] == str(tmp_path)

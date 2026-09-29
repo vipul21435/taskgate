@@ -60,7 +60,7 @@ def manifest_valid(ctx: TaskContext) -> Check:
 NOT_BUILT = "skipped: the environment did not build (see TG301)"
 
 
-def _run_failure(run: RunResult, what: str, timeout_sec: int) -> str:
+def run_failure(run: RunResult, what: str, timeout_sec: int) -> str:
     if run.error is not None:
         return f"{what} could not run: {run.error}"
     if run.timed_out:
@@ -89,7 +89,7 @@ def solution_passes(ctx: TaskContext) -> Check:
     run = ctx.run("reference")
     if run.grader_passed:
         return Check.ok(f"reference solution passes the grader ({run.summary})")
-    return Check.fail(_run_failure(run, "the solution run", ctx.manifest.timeout_sec))
+    return Check.fail(run_failure(run, "the solution run", ctx.manifest.timeout_sec))
 
 
 @gate(
@@ -108,7 +108,7 @@ def baseline_fails(ctx: TaskContext) -> Check:
         return Check.skip(NOT_BUILT)
     run = ctx.run("none")
     if run.error is not None or run.timed_out or run.grader_exit == PYTEST_NO_TESTS:
-        return Check.fail(_run_failure(run, "the baseline run", ctx.manifest.timeout_sec))
+        return Check.fail(run_failure(run, "the baseline run", ctx.manifest.timeout_sec))
     if run.grader_passed:
         return Check.fail(f"the grader passes an untouched workspace ({run.summary})")
     return Check.ok(f"an untouched workspace fails the grader ({run.summary})")
@@ -146,7 +146,7 @@ def stub_solution_fails(ctx: TaskContext) -> Check:
     if run.error is None and not run.timed_out and run.solution_exit not in (None, 0):
         return Check.fail(f"the stub solution exited {run.solution_exit}: {run.summary}")
     if run.error is not None or run.timed_out or run.grader_exit == PYTEST_NO_TESTS:
-        return Check.fail(_run_failure(run, "the stub run", ctx.manifest.timeout_sec))
+        return Check.fail(run_failure(run, "the stub run", ctx.manifest.timeout_sec))
     if run.grader_passed:
         return Check.fail(f"the grader passes {stub} ({run.summary})")
     return Check.ok(f"{stub} fails the grader ({run.summary})")

@@ -13,7 +13,10 @@ overlays that directory's files onto the repository:
   and whose solution script exports a leftover (fake) API key;
 - ``pr/3-gcd-pairs`` adds a task whose grader compares lines with a non-strict
   ``zip()``, so an empty output file passes, and whose Dockerfile names its base
-  image by tag only.
+  image by tag only;
+- ``pr/4-log-levels`` adds a task whose grader caches the parsed output in a
+  module-level dict filled by its first test, so it passes only in file order
+  (the determinism gate, TG501, shuffles the order and catches it).
 
 Author, committer and dates are fixed, so the commit hashes (and therefore the
 reports TaskGate writes) are the same on every machine. DEST is deleted and

@@ -1,0 +1,12 @@
+2026-01-05T08:00:01Z INFO service started on port 8080
+2026-01-05T08:00:02Z DEBUG loaded 42 routes
+2026-01-05T08:00:05Z INFO accepted connection from 10.0.0.7
+2026-01-05T08:01:17Z WARN slow response: 1840 ms for /report
+2026-01-05T08:02:40Z ERROR upstream timed out after 3 retries
+2026-01-05T08:02:41Z INFO retry scheduled in 30 s
+2026-01-05T08:03:11Z INFO accepted connection from 10.0.0.9
+2026-01-05T08:03:12Z DEBUG cache hit ratio 0.93
+2026-01-05T08:04:59Z WARN disk usage at 81 percent
+2026-01-05T08:05:00Z INFO rotated log file
+2026-01-05T08:06:30Z ERROR failed to write metrics: permission denied
+2026-01-05T08:07:45Z INFO service healthy

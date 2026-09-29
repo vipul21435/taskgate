@@ -18,7 +18,9 @@ import pytest
 from taskgate.config import RunnerOptions
 from taskgate.docker_runner import DockerRunner, docker_status
 from taskgate.engine import run_gates
+from taskgate.gates import BUILTIN_GATES
 from taskgate.results import Status
+from taskgate.runner import LocalRunner
 
 pytestmark = pytest.mark.docker
 
@@ -60,6 +62,29 @@ def test_no_network() -> None:
 def test_limits() -> None:
     assert read("memory.txt") == str({MEMORY_MB} * 1024 * 1024)
     assert read("pids.txt") == "256"
+"""
+
+
+FLAKY_GRADER = """\
+import os
+from pathlib import Path
+
+SEEN: list[int] = []
+
+
+def test_first() -> None:
+    SEEN.append(1)
+
+
+def test_second_needs_the_first() -> None:
+    assert SEEN == [1]
+
+
+def test_seeds_and_a_fresh_workspace() -> None:
+    assert os.environ["PYTHONHASHSEED"] == os.environ.get("TASKGATE_SEED", "0")
+    marker = Path("graded.marker")
+    assert not marker.exists()
+    marker.write_text("x")
 """
 
 
@@ -129,3 +154,21 @@ def test_a_slow_solution_is_stopped_and_its_container_removed(
             break
         time.sleep(0.5)
     assert left.strip() == ""
+
+
+def test_the_determinism_gate_finds_the_same_flips_in_docker(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    task = sample(tmp_path)
+    (task / "tests" / "test_outputs.py").write_text(FLAKY_GRADER, encoding="utf-8")
+    gates = [g for g in BUILTIN_GATES if g.code in ("TG101", "TG401", "TG501")]
+    in_docker = {r.code: r for r in run_gates(task, gates=gates, runner=runner)}["TG501"]
+    local = {r.code: r for r in run_gates(task, gates=gates, runner=LocalRunner())}["TG501"]
+    assert in_docker.status is Status.FAIL
+    assert in_docker.message.endswith(
+        "1 test flipped: tests/test_outputs.py::test_second_needs_the_first"
+    )
+    assert in_docker.message == local.message
+    assert [d.replace("--runner docker", "--runner local") for d in in_docker.details] == list(
+        local.details
+    )

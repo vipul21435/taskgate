@@ -9,8 +9,9 @@ from pathlib import Path
 import pytest
 
 from fakedocker import FakeDocker
-from taskfactory import make_task
+from taskfactory import ORDER_DEPENDENT_GRADER, make_task
 from taskgate.config import RunnerOptions
+from taskgate.determinism import parse_junit
 from taskgate.docker_runner import (
     DRIVER,
     NOBODY,
@@ -23,11 +24,12 @@ from taskgate.docker_runner import (
     docker_status,
     image_tag,
     interpret,
+    interpret_regrade,
     run_user,
     select_runner,
 )
 from taskgate.dockerfile import locate
-from taskgate.runner import Completed, LocalRunner, Stub
+from taskgate.runner import Completed, GraderRun, LocalRunner, Regrade, Stub, plugin_source
 
 EXISTS_ONLY = (
     "from pathlib import Path\n\n"
@@ -416,3 +418,96 @@ def test_build_errors_drop_buildkit_cache_ids() -> None:
         'calculate checksum of ref <id>: "/input": not found'
     )
     assert build_error("") == ""
+
+
+def test_regrade_matches_the_local_runner(tmp_path: Path, fake_docker: FakeDocker) -> None:
+    task = make_task(tmp_path / "echo", grader=ORDER_DEPENDENT_GRADER)
+    seeds = (1, 2, 5)
+    docker = DockerRunner().regrade(task, seeds=seeds, timeout_sec=60)
+    local = LocalRunner().regrade(task, seeds=seeds, timeout_sec=60)
+    assert docker.solution.solution_exit == 0
+    assert docker.error is None
+    assert [(r.seed, r.exit) for r in docker.runs] == [(1, 1), (2, 1), (5, 0)]
+    assert [parse_junit(r.junit) for r in docker.runs] == [parse_junit(r.junit) for r in local.runs]
+    assert "1 failed, 1 passed" in docker.runs[0].output
+    (argv,) = fake_docker.calls("run")
+    assert argv[-5:] == ["regrade", "/taskgate", "1", "2", "5"]
+
+
+def test_regrade_restores_the_workspace_between_reruns(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    grader = (
+        "from pathlib import Path\n\n"
+        "def test_fresh() -> None:\n"
+        "    assert Path('output/greeting.txt').read_text() == 'world\\n'\n"
+        "    assert not Path('graded.marker').exists()\n"
+        "    Path('graded.marker').write_text('x')\n"
+        "    Path('output/greeting.txt').write_text('changed by the grader')\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    regraded = DockerRunner().regrade(task, seeds=(1, 2, 3), timeout_sec=60)
+    assert [r.exit for r in regraded.runs] == [0, 0, 0]
+
+
+def test_regrade_archive_carries_the_shuffle_plugin(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    with tarfile.open(fileobj=io.BytesIO(build_archive(task, "reference", plugin=True))) as tar:
+        plugin = tar.extractfile("plugin/taskgate_shuffle.py")
+        assert plugin is not None
+        assert plugin.read() == plugin_source()
+    with tarfile.open(fileobj=io.BytesIO(build_archive(task, "reference"))) as tar:
+        assert "plugin" not in tar.getnames()
+
+
+def test_regrade_stops_at_a_failing_solution_or_a_missing_image(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    task = make_task(tmp_path / "echo", solve="echo broken\nexit 3\n")
+    regraded = DockerRunner().regrade(task, seeds=(1, 2), timeout_sec=60)
+    assert (regraded.solution.solution_exit, regraded.solution.output, regraded.runs) == (
+        3,
+        "broken",
+        (),
+    )
+    broken = make_task(tmp_path / "broken", dockerfile="FROM scratch\nRUN FAKE_BUILD_FAIL\n")
+    unbuilt = DockerRunner().regrade(broken, seeds=(1,), timeout_sec=60)
+    assert (unbuilt.solution.error or "").startswith("the environment did not build: ")
+
+
+def test_regrade_kills_the_container_when_the_budget_runs_out(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    grader = "import time\n\ndef test_slow() -> None:\n    time.sleep(30)\n"
+    task = make_task(tmp_path / "echo", grader=grader)
+    runner = DockerRunner()
+    runner.build(task)
+    regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=1)
+    assert [(r.seed, r.exit, r.junit) for r in regraded.runs] == [(1, None, "")]
+    assert regraded.error is None
+    assert len(fake_docker.calls("kill")) == 1
+
+
+def test_interpret_regrade_edge_cases() -> None:
+    nonce = "abc"
+    mark = f"@@taskgate-{nonce}"
+    solved = f"{mark} listing before\n{mark} listing end\n{mark} solution 0\n"
+
+    def regrade(code: int, stdout: str, seeds: tuple[int, ...]) -> Regrade:
+        return interpret_regrade(Completed(code, stdout, ""), nonce, seeds)
+
+    snapshot = regrade(0, f"{solved}tar: full\n{mark} snapshot-failed\n", (1,))
+    assert snapshot.runs == ()
+    assert snapshot.error == "could not save the solved workspace for the reruns"
+    one = (
+        f"{solved}1 passed\n{mark} regrade 1 0\n{mark} listing junit-1\n<t/>\n{mark} listing end\n"
+    )
+    restore = regrade(0, f"{one}{mark} restore-failed 2\n", (1, 2))
+    assert restore.runs == (GraderRun(1, 0, "<t/>", "1 passed"),)
+    assert restore.error == "could not restore the workspace before rerun 2"
+    oom = regrade(137, one, (1, 2))
+    assert oom.error == "the container exited 137 after 1 of 2 reruns (killed: out of memory?)"
+    assert regrade(1, one, (1, 2, 3)).error == "the container exited 1 after 1 of 3 reruns"
+    assert regrade(0, f"{solved}{mark} regrade 4 x\n", (4,)).runs == (GraderRun(4, None, "", ""),)
+    unsolved = regrade(0, f"{mark} setup-failed\n", (1,))
+    assert unsolved.solution.error == "could not unpack the solution and tests into the container"

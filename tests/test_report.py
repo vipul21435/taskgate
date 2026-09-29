@@ -98,6 +98,7 @@ def test_json_report_round_trips_and_is_stable() -> None:
         "status": "fail",
         "blocking": True,
         "message": "the grader passes an untouched workspace (1 skipped)",
+        "details": [],
         "fix_hint": "Assert on the output.",
     }
     assert data["other_files"] == ["README.md"]
@@ -144,3 +145,47 @@ def test_the_runner_is_named_in_every_format() -> None:
     assert to_text(report).startswith("taskgate 9.9.9: all tasks, 0 tasks, docker runner\n")
     assert "0 blocking failures; all tasks, 0 tasks, docker runner." in to_markdown(report)
     assert to_dict(report)["runner"] == "docker"
+
+
+FLAKY_501 = GateResult(
+    "TG501",
+    "grader-deterministic",
+    Severity.ERROR,
+    Status.FAIL,
+    "1 of 2 reruns failed; 1 test flipped: tests/test_a.py::test_b",
+    fix_hint="Make the tests independent.",
+    details=(
+        "tests/test_a.py::test_b: passed in run 1 (seed 1); failed in run 2 (seed 2); "
+        "reproduce: taskgate grade tasks/a --seed 2 --runner local",
+        "a note | with a pipe",
+    ),
+)
+FLAKY = CheckReport(version="9.9.9", mode="all", tasks=(TaskReport("tasks/a", None, (FLAKY_501,)),))
+
+
+def test_details_are_listed_under_the_message_in_text() -> None:
+    assert to_text(FLAKY).splitlines()[1:6] == [
+        "tasks/a  FAIL",
+        "  FAIL  TG501  grader-deterministic  1 of 2 reruns failed; 1 test flipped: "
+        "tests/test_a.py::test_b",
+        "        - tests/test_a.py::test_b: passed in run 1 (seed 1); failed in run 2 (seed 2); "
+        "reproduce: taskgate grade tasks/a --seed 2 --runner local",
+        "        - a note | with a pipe",
+        "        fix: Make the tests independent.",
+    ]
+
+
+def test_details_get_their_own_list_in_markdown_with_commands_as_code() -> None:
+    markdown = to_markdown(FLAKY)
+    assert (
+        "\nDetails:\n\n"
+        "- **TG501**: tests/test_a.py::test_b: passed in run 1 (seed 1); failed in run 2 "
+        "(seed 2); reproduce: `taskgate grade tasks/a --seed 2 --runner local`\n"
+        "- **TG501**: a note | with a pipe\n\nHow to fix:\n"
+    ) in markdown
+    assert "Details:" not in to_markdown(REPORT)
+
+
+def test_details_are_a_list_in_json() -> None:
+    gate = json.loads(to_json(FLAKY))["tasks"][0]["gates"][0]
+    assert gate["details"] == list(FLAKY_501.details)

@@ -89,6 +89,7 @@ def to_text(report: CheckReport) -> str:
             status = result.status.value.upper() if result.blocking else result.status.value
             name = f"{result.name:<{width}}"
             lines.append(f"  {status:<4}  {result.code}  {name}  {_one_line(result.message)}")
+            lines += [f"        - {_one_line(detail)}" for detail in result.details]
             if result.fix_hint:
                 lines.append(f"        fix: {result.fix_hint}")
     lines.append(f"result: {_result_line(report)}")
@@ -101,6 +102,12 @@ def _one_line(text: str) -> str:
 
 def _cell(text: str) -> str:
     return _one_line(text).replace("|", "\\|")
+
+
+def _detail(text: str) -> str:
+    """A detail line for Markdown: a trailing ``reproduce: CMD`` is shown as code."""
+    head, marker, command = _one_line(text).rpartition("reproduce: ")
+    return f"{head}{marker}`{command}`" if marker else _one_line(text)
 
 
 def _status_cell(result: GateResult) -> str:
@@ -142,6 +149,10 @@ def to_markdown(report: CheckReport) -> str:
         lines += [
             f"| {r.code} {r.name} | {_status_cell(r)} | {_cell(r.message)} |" for r in task.results
         ]
+        detailed = [r for r in task.results if r.details]
+        if detailed:
+            lines += ["", "Details:", ""]
+            lines += [f"- **{r.code}**: {_detail(d)}" for r in detailed for d in r.details]
         hints = [r for r in task.results if r.fix_hint]
         if hints:
             lines += ["", "How to fix:", ""]
@@ -159,6 +170,7 @@ def _result_dict(result: GateResult) -> dict[str, Any]:
         "status": result.status.value,
         "blocking": result.blocking,
         "message": result.message,
+        "details": list(result.details),
         "fix_hint": result.fix_hint,
     }
 

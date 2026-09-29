@@ -28,7 +28,7 @@ cov: ## Run the tests with the coverage gate (fail_under in pyproject.toml)
 
 check: lint typecheck cov ## Everything CI runs except Docker
 
-demo: ## Offline end to end: build a sample repo with three task pull requests and check each
+demo: ## Offline end to end: build a sample repo with four task pull requests and check each
 	$(UV) run taskgate tasks $(SAMPLE)
 	$(UV) run sh examples/demo.sh $(DEMO_DIR)
 

@@ -6,6 +6,7 @@ from taskgate.config import (
     CONFIG_FILE,
     Config,
     ConfigError,
+    DeterminismOptions,
     FileOptions,
     ManifestOptions,
     RunnerOptions,
@@ -231,3 +232,27 @@ def test_runner_section_problems_are_listed_at_once() -> None:
         "  runner.pids_limit must be an integer",
         "  runner.build_timeout_sec 9000 is outside 10..7200",
     ]
+
+
+def test_determinism_runs_and_seed() -> None:
+    config = parse("[determinism]\nruns = 10\nseed = 100\n", "taskgate.toml")
+    assert config.determinism == DeterminismOptions(runs=10, seed=100)
+    assert config.determinism.seeds == tuple(range(100, 110))
+    assert Config().determinism.seeds == (1, 2, 3, 4, 5)
+    assert config.summary().options == (("determinism.runs", 10), ("determinism.seed", 100))
+
+
+@pytest.mark.parametrize(
+    ("text", "problem"),
+    [
+        ("[determinism]\nruns = 1\n", "determinism.runs 1 is outside 2..100"),
+        ("[determinism]\nruns = 101\n", "determinism.runs 101 is outside 2..100"),
+        ("[determinism]\nseed = -1\n", "determinism.seed -1 is outside 0..2147483647"),
+        ('[determinism]\nseed = "1"\n', "determinism.seed must be an integer"),
+        ("[determinism]\nrerun = 3\n", "unknown key determinism.rerun"),
+    ],
+)
+def test_bad_determinism_options(text: str, problem: str) -> None:
+    with pytest.raises(ConfigError) as error:
+        parse(text, "taskgate.toml")
+    assert problem in str(error.value)

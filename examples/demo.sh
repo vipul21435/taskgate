@@ -1,7 +1,7 @@
 #!/bin/sh
 # Offline end-to-end demo: build the sample repository, then run `taskgate check`
 # on each pull-request branch the way CI would (branch checked out, diff against
-# main). The good pull request must exit 0 and the bad one must exit 1.
+# main). The good pull request must exit 0 and each of the three flawed ones 1.
 #
 # Usage: sh examples/demo.sh [WORKDIR]   (default: $TMPDIR/taskgate-demo)
 #
@@ -35,8 +35,9 @@ check_branch() {
 check_branch pr/1-integer-determinant 0
 check_branch pr/2-word-count 1
 check_branch pr/3-gcd-pairs 1
+check_branch pr/4-log-levels 1
 git -C "$repo" checkout -q main
 
 echo
-echo "demo ok: the good pull request passed and both bad ones were blocked"
+echo "demo ok: the good pull request passed and all three flawed ones were blocked"
 echo "reports: $work/out"

@@ -31,7 +31,7 @@ jobs:
         run: make typecheck
       - name: Tests with coverage gate
         run: make cov
-      - name: Demo - build the sample repository and check both task pull requests
+      - name: Demo - build the sample repository and check its four task pull requests
         run: make demo
       - name: Publish the demo reports to the job summary
         if: always()

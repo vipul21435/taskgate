@@ -9,7 +9,7 @@ plain function into one.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
@@ -18,7 +18,7 @@ from taskgate import manifest
 from taskgate.config import Config
 from taskgate.files import regular_files, tracked_regular_files
 from taskgate.results import Severity, Status
-from taskgate.runner import BuildResult, LocalRunner, Runner, RunResult, Solution
+from taskgate.runner import BuildResult, LocalRunner, Regrade, Runner, RunResult, Solution
 
 BINARY_SNIFF_BYTES = 8000
 """Like git, a file is binary when a NUL byte appears in its first 8000 bytes."""
@@ -35,14 +35,16 @@ class Check:
 
     status: Status
     message: str
+    details: tuple[str, ...] = ()
+    """Extra lines for the report (each flaky test, each problem), shown under the message."""
 
     @classmethod
     def ok(cls, message: str) -> Check:
         return cls(Status.PASS, message)
 
     @classmethod
-    def fail(cls, message: str) -> Check:
-        return cls(Status.FAIL, message)
+    def fail(cls, message: str, details: Sequence[str] = ()) -> Check:
+        return cls(Status.FAIL, message, tuple(details))
 
     @classmethod
     def skip(cls, message: str) -> Check:
@@ -65,10 +67,19 @@ class TaskContext:
     """In diff mode, every path git tracks in the task at the checked commit
     (relative to the task directory); ``None`` when a plain directory is checked."""
 
+    label: str | None = None
+    """The task's path as reports show it (relative to the repository or checked
+    root); commands a gate suggests use it. Defaults to the directory name."""
+
     _manifest: manifest.ManifestCheck | None = field(default=None, repr=False)
     _files: tuple[PurePosixPath, ...] | None = field(default=None, repr=False)
     _build: BuildResult | None = field(default=None, repr=False)
     _runs: dict[Solution, RunResult] = field(default_factory=dict, repr=False)
+    _regrades: dict[tuple[int, ...], Regrade] = field(default_factory=dict, repr=False)
+
+    @property
+    def path_label(self) -> str:
+        return self.label or self.task_dir.name
 
     @property
     def manifest(self) -> manifest.ManifestCheck:
@@ -109,6 +120,15 @@ class TaskContext:
                 self.task_dir, solution=solution, timeout_sec=self.manifest.timeout_sec
             )
         return self._runs[solution]
+
+    def regrade(self, seeds: Sequence[int]) -> Regrade:
+        """The reference solution once, then the grader once per seed (once per context)."""
+        key = tuple(seeds)
+        if key not in self._regrades:
+            self._regrades[key] = self.runner.regrade(
+                self.task_dir, seeds=key, timeout_sec=self.manifest.timeout_sec
+            )
+        return self._regrades[key]
 
 
 @runtime_checkable

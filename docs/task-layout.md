@@ -49,6 +49,32 @@ creates every file the reference solution created, empty, and nothing else
 reference `solve.sh` and did not before it; files it changed in place are left
 alone by the stub, and cache files (`__pycache__/`, `*.pyc`) do not count.
 
+A fourth kind of run checks that the grader is deterministic (TG501): the
+reference solution runs once more, then the grader runs `[determinism] runs`
+times (default 5) on identical copies of its output. Rerun `i` uses seed
+`s = seed + i - 1` (`seed` defaults to 1) three ways:
+
+- the test order is shuffled with `random.Random(s)` by a small pytest plugin
+  TaskGate bundles (`src/taskgate/shuffle_plugin.py`, copied into the run as
+  `taskgate_shuffle.py` and loaded with `-p taskgate_shuffle --taskgate-seed s`),
+  which also seeds Python's `random` module with `s` before collection;
+- `PYTHONHASHSEED=s`, so set and `dict`-of-`set` ordering changes (TG401 runs
+  with `PYTHONHASHSEED=0`);
+- `TASKGATE_SEED=s`, for graders that draw random cases and should seed from it.
+
+Each rerun writes pytest's JUnit XML (`-o junit_family=xunit1`, which keeps each
+test's file), and TaskGate compares the exit code and every test's outcome
+(passed, failed, error, skipped) across the reruns. Before each rerun after the
+first, the workspace is restored to the state `solve.sh` left, so a grader that
+writes into the workspace cannot change a later rerun. The solution and all the
+reruns share a budget of `(runs + 1) x timeout_sec`.
+
+`taskgate grade TASK --seed S [--runner ...]` repeats one rerun: the reference
+solution, then the grader with seed `S`, printing pytest's output and each
+test's outcome in the order the tests ran. TG501 prints this command for every
+flipped test, with the task path as reports show it, so run it from the
+repository root (the directory the report's task paths are relative to).
+
 ### Runners
 
 `taskgate check --runner auto|docker|local` (or `TASKGATE_RUNNER`) picks where
@@ -71,6 +97,12 @@ image with:
 - `solution/` (or the stub) and `tests/` streamed in as a tar archive on stdin
   and unpacked into a tmpfs at `/taskgate`, outside the workspace;
 - the workdir from `environment.workdir`, as the image provides it.
+
+For TG501 the driver runs the reruns in the same container: after `solve.sh`
+it saves the workdir as a tar in the tmpfs, and before each later rerun it
+deletes the workdir's contents and unpacks the tar again, so the image must also
+provide `find` with `-mindepth` and `-delete`. The shuffle plugin travels in the
+same tar on stdin as the solution and tests.
 
 When the budget runs out the container is killed (`docker kill`) and removed.
 The limits come from `[runner]` in `taskgate.toml` (`cpus`, `memory_mb`,
@@ -192,6 +224,18 @@ matches `/` (`tests/data/*` covers every file below `tests/data/`).
 | TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
 | TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
 | TG403 | stub-solution-fails | yes | the grader fails after a stub that creates the reference solution's new files, empty (requires TG401) |
+| TG501 | grader-deterministic | yes | on `[determinism] runs` reruns (default 5) with shuffled test order and new `PYTHONHASHSEED` and `TASKGATE_SEED`, every rerun passes and every test has the same outcome (requires TG401) |
+
+TG501 fails when any rerun fails, when a test's outcome differs between reruns,
+or when a test fails in every rerun (TG401's run passed, so it flipped against
+that one). Each flipped test is listed with the runs and seeds of each outcome
+and a `taskgate grade` command for the first rerun where it did not pass, for
+example:
+
+```
+tests/test_outputs.py::test_counts_match: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4);
+passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner local
+```
 
 A gate whose requirement did not pass is reported as `skip`, not as a second
 failure. TG401 and TG402 also skip when the runner could not build the

@@ -1,0 +1,9 @@
+[task]
+id = "log-levels"
+title = "Count log lines per level"
+difficulty = "easy"
+timeout_sec = 60
+
+[environment]
+dockerfile = "Dockerfile"
+workdir = "/workspace"

@@ -9,6 +9,8 @@ import pytest
 from fakedocker import FakeDocker, install
 from gitrepo import GitRepo
 
+pytest_plugins = ("pytester",)
+
 
 @pytest.fixture(autouse=True)
 def local_runner_by_default(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -41,13 +41,14 @@ def sample_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return dest
 
 
-def test_builder_creates_main_and_three_pull_request_branches(sample_repo: Path) -> None:
+def test_builder_creates_main_and_four_pull_request_branches(sample_repo: Path) -> None:
     branches = git(sample_repo, "branch", "--format=%(refname:short)").split()
     assert branches == [
         "main",
         "pr/1-integer-determinant",
         "pr/2-word-count",
         "pr/3-gcd-pairs",
+        "pr/4-log-levels",
     ]
     assert git(sample_repo, "status", "--porcelain") == ""
 
@@ -91,6 +92,26 @@ def test_existence_only_grader_and_unpinned_base_are_blocked(sample_repo: Path) 
         "TG302": "1 image is not pinned by digest: line 3: FROM python:3.12-slim",
         "TG403": "the grader passes a stub that writes output/gcds.txt empty (2 passed)",
     }
+
+
+def test_order_dependent_grader_is_blocked_by_the_determinism_gate(sample_repo: Path) -> None:
+    code, report = check_branch(sample_repo, "pr/4-log-levels")
+    assert code == 1
+    assert report["blocking_failures"] == 1
+    (task,) = report["tasks"]
+    failed = [gate for gate in task["gates"] if gate["status"] == "fail"]
+    assert [gate["code"] for gate in failed] == ["TG501"]
+    (gate,) = failed
+    assert gate["message"] == (
+        "4 of 5 reruns failed; 2 tests flipped: tests/test_outputs.py::test_counts_match, "
+        "tests/test_outputs.py::test_one_line_per_level"
+    )
+    assert gate["details"] == [
+        f"tests/test_outputs.py::{test}: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); "
+        "passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 "
+        "--runner local"
+        for test in ("test_counts_match", "test_one_line_per_level")
+    ]
 
 
 def test_reports_are_byte_identical_across_builds(tmp_path: Path) -> None:

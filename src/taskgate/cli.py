@@ -10,12 +10,22 @@ from typing import Annotated
 
 import typer
 
-from taskgate import __version__
+from taskgate import __version__, manifest
 from taskgate.changes import GitError, changed_tasks, read_file_at, repo_root
-from taskgate.config import CONFIG_FILE, Config, ConfigError, discover, load_file, parse
+from taskgate.config import (
+    CONFIG_FILE,
+    MAX_SEED,
+    Config,
+    ConfigError,
+    discover,
+    load_file,
+    parse,
+)
+from taskgate.determinism import JUnitError, parse_junit
 from taskgate.docker_runner import RunnerChoice, RunnerUnavailableError, select_runner
 from taskgate.engine import run_gates
-from taskgate.layout import TaskDir, find_tasks
+from taskgate.gates.core import run_failure
+from taskgate.layout import TASK_MANIFEST, TaskDir, find_tasks
 from taskgate.registry import (
     GROUPS,
     Registry,
@@ -148,7 +158,13 @@ def _check_all(root: Path, config_path: Path | None, choice: RunnerChoice) -> Ch
         TaskReport(
             path=task.path.as_posix(),
             change=None,
-            results=run_gates(root / task.path, gates=registry.gates, config=config, runner=runner),
+            results=run_gates(
+                root / task.path,
+                gates=registry.gates,
+                config=config,
+                runner=runner,
+                label=task.path.as_posix(),
+            ),
         )
         for task in found
     )
@@ -184,6 +200,7 @@ def _check_diff(
                 config=config,
                 runner=runner,
                 tracked=task.tracked,
+                label=task.path.as_posix(),
             ),
             changed_files=task.files,
         )
@@ -200,6 +217,18 @@ def _check_diff(
         runner=runner.name,
     )
 
+
+RunnerOption = Annotated[
+    RunnerChoice,
+    typer.Option(
+        "--runner",
+        envvar="TASKGATE_RUNNER",
+        help=(
+            "Where solutions and graders run: docker when the daemon answers, else "
+            "local (auto); docker only (exit 2 without it); or local only."
+        ),
+    ),
+]
 
 ConfigOption = Annotated[
     Path | None,
@@ -235,17 +264,7 @@ def check(
         OutputFormat, typer.Option("--format", help="What to print on stdout.")
     ] = OutputFormat.TEXT,
     config_path: ConfigOption = None,
-    runner_choice: Annotated[
-        RunnerChoice,
-        typer.Option(
-            "--runner",
-            envvar="TASKGATE_RUNNER",
-            help=(
-                "Where solutions and graders run: docker when the daemon answers, else "
-                "local (auto); docker only (exit 2 without it); or local only."
-            ),
-        ),
-    ] = RunnerChoice.AUTO,
+    runner_choice: RunnerOption = RunnerChoice.AUTO,
 ) -> None:
     """Run the review gates on the tasks a pull request changes.
 
@@ -264,6 +283,74 @@ def check(
         typer.echo(f"wrote {out / 'report.md'} and {out / 'report.json'}", err=True)
     if not report.passed:
         raise typer.Exit(1)
+
+
+@app.command()
+def grade(
+    task: Annotated[Path, typer.Argument(help="Task directory (the one holding task.toml).")],
+    seed: Annotated[
+        int,
+        typer.Option(
+            "--seed",
+            min=0,
+            max=MAX_SEED,
+            help="The seed of the rerun to repeat, as TG501 reports it.",
+        ),
+    ],
+    runner_choice: RunnerOption = RunnerChoice.AUTO,
+    config_path: ConfigOption = None,
+) -> None:
+    """Repeat one TG501 rerun: the reference solution, then the grader with SEED.
+
+    The tests run in the order the seed shuffles them into, with PYTHONHASHSEED
+    and TASKGATE_SEED set to the seed, so a test TG501 reports as flipped fails
+    the same way again. Prints pytest's output and each test's outcome in the
+    order the tests ran. Exits 0 when the grader passes, 1 when the solution or
+    the grader fails, and 2 on usage errors.
+    """
+    if not (task / TASK_MANIFEST).is_file():
+        raise _fail_usage(f"{task} is not a task directory (no {TASK_MANIFEST})")
+    config = _config(_registry(), config_path, lambda: discover(Path()))
+    runner = _runner(runner_choice, config)
+    timeout = manifest.load(task).timeout_sec
+    typer.echo(
+        f"taskgate grade {task.as_posix()}: reference solution, then the grader with seed "
+        f"{seed} (shuffled order, PYTHONHASHSEED={seed}, TASKGATE_SEED={seed}), "
+        f"{runner.name} runner"
+    )
+    regraded = runner.regrade(task, seeds=(seed,), timeout_sec=timeout)
+    solution = regraded.solution
+    if solution.output:
+        typer.echo(solution.output)
+    if solution.timed_out:
+        why = f"solve.sh did not finish within 2 x task.timeout_sec = {2 * timeout} s"
+    elif solution.solution_exit != 0 or solution.error is not None:
+        why = run_failure(solution, "the solution run", timeout)
+    elif not regraded.runs:
+        why = regraded.error or "the grader did not run"
+    else:
+        why = ""
+    if why:
+        typer.echo(f"result: FAIL ({why})")
+        raise typer.Exit(1)
+    (run,) = regraded.runs
+    typer.echo(run.output.rstrip("\n"))
+    try:
+        outcomes = parse_junit(run.junit)
+    except JUnitError as exc:
+        typer.echo(f"({exc})")
+        outcomes = {}
+    for test, outcome in outcomes.items():
+        typer.echo(f"{outcome:<7}  {test}")
+    if run.exit == 0:
+        typer.echo("result: PASS")
+        return
+    if run.exit is None:
+        why = f"the grader did not finish within 2 x task.timeout_sec = {2 * timeout} s"
+    else:
+        why = f"pytest exited {run.exit}"
+    typer.echo(f"result: FAIL ({why})")
+    raise typer.Exit(1)
 
 
 def _gate_json(registry: Registry, config: Config) -> list[dict[str, object]]:

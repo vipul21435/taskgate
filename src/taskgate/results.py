@@ -38,6 +38,9 @@ class GateResult:
     fix_hint: str | None = None
     """How to fix the task; set only when the gate failed."""
 
+    details: tuple[str, ...] = ()
+    """Extra lines under the message, e.g. each flaky test and how to reproduce it."""
+
     @property
     def blocking(self) -> bool:
         """True when this result alone makes the pull request fail."""

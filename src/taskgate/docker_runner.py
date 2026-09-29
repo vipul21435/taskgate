@@ -17,6 +17,11 @@ by the Dockerfile), lists the workspace before and after it, and runs
 ``python -m pytest``; it refuses to run at all as uid 0. The driver marks each
 step on stdout with a per-run nonce, so task output cannot forge a marker by
 accident. When the task's ``timeout_sec`` runs out, the container is killed.
+
+A regrade (TG501) is one container too: after ``solve.sh`` the driver saves the
+workdir as a tar in the tmpfs, runs the grader once per seed with the shuffle
+plugin, ``PYTHONHASHSEED`` and ``TASKGATE_SEED``, prints each run's JUnit XML
+between markers, and restores the workdir from the tar before the next run.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ import secrets
 import shutil
 import tarfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -40,16 +45,23 @@ from taskgate.config import RunnerOptions
 from taskgate.dockerfile import locate
 from taskgate.files import IGNORED_DIRS, is_ignored
 from taskgate.runner import (
+    JUNIT_FILE,
+    PLUGIN_DIR,
+    PLUGIN_MODULE,
     SOLUTION_ENTRY,
     BuildResult,
     Completed,
+    GraderRun,
     LocalRunner,
+    Regrade,
     Runner,
     RunResult,
     Solution,
     Stub,
     execute,
     grader_argv,
+    plugin_source,
+    regrade_args,
     tail,
 )
 
@@ -69,13 +81,16 @@ MARK = "@@taskgate-"
 DIGEST_VERSION = b"taskgate-env-v1"
 BUILDKIT_REF = re.compile(r"\bref [a-z0-9]+::[a-z0-9]+")
 
+SNAPSHOT = "solved.tar"
+_RERUN = grader_argv('"$py"', '"$stage"') + regrade_args('"$seed"', f'"$stage/{JUNIT_FILE}"')
 DRIVER = f"""\
 nonce=$1 mode=$2 stage=$3
+shift 3
 exec 2>&1
 mark() {{ printf '\\n{MARK}%s %s\\n' "$nonce" "$*"; }}
 if [ "$(id -u)" = 0 ]; then mark refuse-root; exit 0; fi
 if ! tar -xf - -C "$stage"; then mark setup-failed; exit 0; fi
-if [ "$mode" = solve ]; then
+if [ "$mode" != none ]; then
     mark listing before
     find . -type f
     mark listing end
@@ -88,10 +103,35 @@ if [ "$mode" = solve ]; then
     mark listing end
 fi
 if command -v python >/dev/null 2>&1; then py=python; else py=python3; fi
-{" ".join(grader_argv('"$py"', '"$stage"'))} </dev/null
-mark grader "$?"
+if [ "$mode" != regrade ]; then
+    {" ".join(grader_argv('"$py"', '"$stage"'))} </dev/null
+    mark grader "$?"
+    exit 0
+fi
+if ! tar -cf "$stage/{SNAPSHOT}" .; then mark snapshot-failed; exit 0; fi
+first=1
+for seed in "$@"; do
+    if [ "$first" = 0 ]; then
+        find . -mindepth 1 -delete
+        if ! tar -xf "$stage/{SNAPSHOT}"; then mark restore-failed "$seed"; exit 0; fi
+    fi
+    first=0
+    rm -f "${{stage:?}}/{JUNIT_FILE}"
+    PYTHONHASHSEED=$seed TASKGATE_SEED=$seed \\
+    PYTHONPATH="$stage/{PLUGIN_DIR}${{PYTHONPATH:+:$PYTHONPATH}}" \\
+        {" ".join(_RERUN)} </dev/null
+    code=$?
+    mark regrade "$seed" "$code"
+    mark listing "junit-$seed"
+    cat "$stage/{JUNIT_FILE}" 2>/dev/null
+    mark listing end
+done
 """
-"""The in-container driver, run as ``sh -c DRIVER taskgate-driver NONCE MODE STAGE_DIR``."""
+"""The in-container driver: ``sh -c DRIVER taskgate-driver NONCE MODE STAGE_DIR [SEED...]``.
+
+``MODE`` is ``none`` (grader only), ``solve`` (``solve.sh``, then the grader) or
+``regrade`` (``solve.sh``, then the grader once per ``SEED``).
+"""
 
 
 class RunnerChoice(StrEnum):
@@ -180,19 +220,27 @@ def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes, mode: int) -> None:
     tar.addfile(info, io.BytesIO(data))
 
 
-def build_archive(task_dir: Path, solution: Solution) -> bytes:
-    """``tests/``, ``pytest.ini`` and (unless ``none``) ``solution/`` as an uncompressed tar."""
+def _add_dir(tar: tarfile.TarFile, name: str) -> None:
+    directory = tarfile.TarInfo(name)
+    directory.type = tarfile.DIRTYPE
+    directory.mode = 0o755
+    tar.addfile(directory)
+
+
+def build_archive(task_dir: Path, solution: Solution, *, plugin: bool = False) -> bytes:
+    """``tests/``, ``pytest.ini``, (unless ``none``) ``solution/`` and, for a regrade, the
+    shuffle plugin under ``plugin/``, as an uncompressed tar."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         tar.add(task_dir / "tests", arcname="tests", filter=_normalize)
         if isinstance(solution, Stub):
-            directory = tarfile.TarInfo("solution")
-            directory.type = tarfile.DIRTYPE
-            directory.mode = 0o755
-            tar.addfile(directory)
+            _add_dir(tar, "solution")
             _add_bytes(tar, f"solution/{SOLUTION_ENTRY}", solution.script().encode(), 0o755)
         elif solution == "reference":
             tar.add(task_dir / "solution", arcname="solution", filter=_normalize)
+        if plugin:
+            _add_dir(tar, PLUGIN_DIR)
+            _add_bytes(tar, f"{PLUGIN_DIR}/{PLUGIN_MODULE}.py", plugin_source(), 0o644)
         _add_bytes(tar, "pytest.ini", b"[pytest]\n", 0o644)
     return buffer.getvalue()
 
@@ -219,6 +267,9 @@ class _Transcript:
     pending: list[str] = field(default_factory=list)
     """Output after the last step marker (the step that was running when it ended)."""
 
+    steps: list[tuple[str, str, list[str]]] = field(default_factory=list)
+    """Every step marker in order, as ``(event, value, output before it)``."""
+
     @classmethod
     def parse(cls, stdout: str, nonce: str) -> _Transcript:
         marker = f"{MARK}{nonce} "
@@ -232,6 +283,7 @@ class _Transcript:
                     continue
                 transcript.events[event] = value
                 transcript.outputs[event] = transcript.pending
+                transcript.steps.append((event, value, transcript.pending))
                 transcript.pending = []
             elif listing is not None:
                 listing.append(line)
@@ -244,7 +296,8 @@ class _Transcript:
         return int(value) if value is not None and value.lstrip("-").isdigit() else None
 
     def output(self, step: str) -> str:
-        return tail("\n".join(self.outputs.get(step, [])))
+        """The last lines ``step`` printed, without the blank lines the markers add."""
+        return tail("\n".join(self.outputs.get(step, [])).strip("\n"))
 
 
 def interpret(done: Completed, nonce: str) -> RunResult:
@@ -292,6 +345,33 @@ def interpret(done: Completed, nonce: str) -> RunResult:
         output=tail("\n".join([*transcript.pending, *done.stderr.splitlines()])),
         error=f"the container exited {done.code} before the {step} finished{why}",
     )
+
+
+def interpret_regrade(done: Completed, nonce: str, seeds: Sequence[int]) -> Regrade:
+    """Turn one ``docker run`` of :data:`DRIVER` in ``regrade`` mode into a :class:`Regrade`."""
+    transcript = _Transcript.parse(done.stdout, nonce)
+    if transcript.exit_code("solution") != 0:
+        return Regrade(interpret(done, nonce))
+    solved = RunResult(0, None, timed_out=False, output="")
+    runs: list[GraderRun] = []
+    for event, value, output in transcript.steps:
+        if event == "regrade":
+            seed, _, code = value.partition(" ")
+            junit = "\n".join(transcript.listings.get(f"junit-{seed}", []))
+            exit_code = int(code) if code.lstrip("-").isdigit() else None
+            runs.append(GraderRun(int(seed), exit_code, junit, "\n".join(output).strip("\n")))
+    error: str | None = None
+    if "snapshot-failed" in transcript.events:
+        error = "could not save the solved workspace for the reruns"
+    elif "restore-failed" in transcript.events:
+        error = f"could not restore the workspace before rerun {len(runs) + 1}"
+    elif len(runs) < len(seeds) and done.code is None:
+        unfinished = "\n".join([*transcript.pending, *done.stderr.splitlines()])
+        runs.append(GraderRun(seeds[len(runs)], None, "", unfinished))
+    elif len(runs) < len(seeds):
+        why = " (killed: out of memory?)" if done.code == OOM_EXIT else ""
+        error = f"the container exited {done.code} after {len(runs)} of {len(seeds)} reruns{why}"
+    return Regrade(solved, tuple(runs), error=error)
 
 
 @dataclass
@@ -392,7 +472,14 @@ class DockerRunner:
         return BuildResult(ok=True, message=f"image {tag}", image=tag, user=found[1])
 
     def run_argv(
-        self, image: str, user: str, workdir: str, name: str, nonce: str, mode: str
+        self,
+        image: str,
+        user: str,
+        workdir: str,
+        name: str,
+        nonce: str,
+        mode: str,
+        seeds: Sequence[int] = (),
     ) -> list[str]:
         """``docker run`` arguments (after ``docker``) for one locked-down driver run."""
         limits = self.options
@@ -437,9 +524,13 @@ class DockerRunner:
             nonce,
             mode,
             STAGE_DIR,
+            *(str(seed) for seed in seeds),
         ]
 
-    def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
+    def _drive(
+        self, task_dir: Path, solution: Solution, timeout_sec: float, seeds: Sequence[int] = ()
+    ) -> tuple[Completed, str] | RunResult:
+        """Run one driver container: its output and nonce, or why it could not run."""
         built = self.build(task_dir)
         if not built.ok or built.image is None:
             return RunResult(
@@ -452,15 +543,14 @@ class DockerRunner:
         deadline = time.monotonic() + timeout_sec
         nonce = secrets.token_hex(8)
         name = f"taskgate-run-{nonce}"
-        mode = "none" if solution == "none" else "solve"
-        argv = self.run_argv(
-            built.image, built.user, manifest.load(task_dir).workdir, name, nonce, mode
-        )
+        mode = "regrade" if seeds else "none" if solution == "none" else "solve"
+        workdir = manifest.load(task_dir).workdir
+        argv = self.run_argv(built.image, built.user, workdir, name, nonce, mode, seeds)
         try:
             done = self._cli(
                 *argv,
                 timeout=deadline - time.monotonic(),
-                stdin=build_archive(task_dir, solution),
+                stdin=build_archive(task_dir, solution, plugin=bool(seeds)),
                 merge_stderr=False,
                 on_timeout=lambda: self._kill(name),
             )
@@ -468,7 +558,18 @@ class DockerRunner:
             return RunResult(
                 None, None, timed_out=False, output="", error=f"cannot run docker: {exc}"
             )
-        return interpret(done, nonce)
+        return done, nonce
+
+    def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
+        driven = self._drive(task_dir, solution, timeout_sec)
+        return driven if isinstance(driven, RunResult) else interpret(*driven)
+
+    def regrade(self, task_dir: Path, *, seeds: Sequence[int], timeout_sec: float) -> Regrade:
+        budget = timeout_sec * (len(seeds) + 1)
+        driven = self._drive(task_dir, "reference", budget, tuple(seeds))
+        if isinstance(driven, RunResult):
+            return Regrade(driven)
+        return interpret_regrade(*driven, seeds)
 
     def _kill(self, name: str) -> None:
         with contextlib.suppress(OSError):

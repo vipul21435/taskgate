@@ -58,6 +58,44 @@ def test_greeting() -> None:
 """
 
 
+ORDER_DEPENDENT_GRADER = """\
+from pathlib import Path
+
+CACHE: dict[str, str] = {}
+
+
+def test_output_is_read() -> None:
+    CACHE["greeting"] = Path("output/greeting.txt").read_text(encoding="utf-8")
+
+
+def test_greeting_matches() -> None:
+    assert CACHE["greeting"] == "world\\n"
+"""
+"""Passes in file order only: the second test reuses what the first one cached."""
+
+WORDS = '["alpha", "bravo", "charlie", "delta", "echo"]'
+HASH_ORDER_SOLVE = f"""\
+#!/bin/sh
+set -eu
+mkdir -p output
+python3 -c 'print("\\n".join(set({WORDS})))' > output/words.txt
+"""
+HASH_ORDER_GRADER = f"""\
+from pathlib import Path
+
+
+def test_words_in_order() -> None:
+    expected = "".join(word + "\\n" for word in set({WORDS}))
+    assert Path("output/words.txt").read_text(encoding="utf-8") == expected
+
+
+def test_one_word_per_line() -> None:
+    assert len(Path("output/words.txt").read_text(encoding="utf-8").splitlines()) == 5
+"""
+"""The solution and the grader both iterate a set, so they agree only under the same
+``PYTHONHASHSEED`` (TG401 runs both with 0; TG501's reruns change the grader's)."""
+
+
 def make_task(
     task_dir: Path,
     *,

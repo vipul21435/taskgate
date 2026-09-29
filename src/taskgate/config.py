@@ -23,11 +23,15 @@
     max_task_bytes = 10485760
     binary_allow = ["environment/workspace/*.png"]
 
-    [runner]                     # the Docker runner (TG301, TG401-TG403)
+    [runner]                     # the Docker runner (TG301, TG401-TG403, TG501)
     cpus = 1.0                   # docker run --cpus
     memory_mb = 1024             # docker run --memory (swap is not allowed on top)
     pids_limit = 256             # docker run --pids-limit
     build_timeout_sec = 900      # docker build wall-clock limit
+
+    [determinism]                # TG501
+    runs = 5                     # grader reruns, each with its own seed
+    seed = 1                     # run i uses seed + i - 1
 
 Globs use :func:`fnmatch.fnmatchcase` on task-relative POSIX paths, so ``*``
 also matches ``/``. Validation collects every problem before failing, and
@@ -100,7 +104,25 @@ class RunnerOptions:
     build_timeout_sec: int = 900
 
 
-OptionSection = ManifestOptions | SecretOptions | FileOptions | RunnerOptions
+MAX_SEED = (1 << 31) - 1
+MAX_RUNS = 100
+
+
+@dataclass(frozen=True, slots=True)
+class DeterminismOptions:
+    """TG501: how many grader reruns and the seed of the first one."""
+
+    runs: int = 5
+    seed: int = 1
+    """Rerun ``i`` (from 1) uses seed ``seed + i - 1`` for the test order,
+    ``PYTHONHASHSEED`` and ``TASKGATE_SEED``."""
+
+    @property
+    def seeds(self) -> tuple[int, ...]:
+        return tuple(range(self.seed, self.seed + self.runs))
+
+
+OptionSection = ManifestOptions | SecretOptions | FileOptions | RunnerOptions | DeterminismOptions
 """The dataclasses behind the option sections (``[manifest]``, ``[secrets]``, ...)."""
 
 
@@ -127,6 +149,7 @@ class Config:
     secrets: SecretOptions = SecretOptions()
     files: FileOptions = FileOptions()
     runner: RunnerOptions = RunnerOptions()
+    determinism: DeterminismOptions = DeterminismOptions()
 
     def severity_for(self, code: str, default: Severity) -> Severity:
         return self.severity.get(code, default)
@@ -150,6 +173,7 @@ class Config:
                 *_overrides("secrets", self.secrets),
                 *_overrides("files", self.files),
                 *_overrides("runner", self.runner),
+                *_overrides("determinism", self.determinism),
             ),
         )
 
@@ -286,10 +310,20 @@ def _runner(raw: Mapping[str, Any], problems: _Problems) -> RunnerOptions:
     )
 
 
+def _determinism(raw: Mapping[str, Any], problems: _Problems) -> DeterminismOptions:
+    section = problems.section(raw, "determinism", ("runs", "seed"))
+    default = DeterminismOptions()
+    return DeterminismOptions(
+        runs=section.integer("runs", default.runs, 2, MAX_RUNS),
+        seed=section.integer("seed", default.seed, 0, MAX_SEED),
+    )
+
+
 def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     """Validate a parsed ``taskgate.toml``; raise :class:`ConfigError` listing every problem."""
     problems = _Problems()
-    problems.unknown(raw, ("gates", "manifest", "secrets", "files", "runner"), "")
+    sections = ("gates", "manifest", "secrets", "files", "runner", "determinism")
+    problems.unknown(raw, sections, "")
     gates = problems.table(raw, "gates", "[gates]")
     problems.unknown(gates, ("disable", "severity"), "gates.")
     disabled = _codes(gates.get("disable", []), "gates.disable", problems)
@@ -298,6 +332,7 @@ def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     secrets = _secrets(raw, problems)
     files = _files(raw, problems)
     runner = _runner(raw, problems)
+    determinism = _determinism(raw, problems)
     if problems:
         raise ConfigError(f"invalid {source}:\n  " + "\n  ".join(problems))
     return Config(
@@ -308,6 +343,7 @@ def from_dict(raw: Mapping[str, Any], source: str) -> Config:
         secrets=secrets,
         files=files,
         runner=runner,
+        determinism=determinism,
     )
 
 
