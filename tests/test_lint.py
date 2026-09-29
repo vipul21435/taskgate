@@ -1,5 +1,6 @@
 """Manifest and instruction lint gates (TG103, TG104, TG105) on passing and failing fixtures."""
 
+import time
 from pathlib import Path
 
 import pytest
@@ -7,7 +8,7 @@ import pytest
 from taskfactory import make_task
 from taskgate.config import Config, ManifestOptions
 from taskgate.engine import run_gates
-from taskgate.gates.lint import LINT_GATES
+from taskgate.gates.lint import LINT_GATES, read_instruction, strip_comments
 from taskgate.results import GateResult, Severity, Status
 
 GOOD_MANIFEST_TAIL = '\n[environment]\ndockerfile = "Dockerfile"\nworkdir = "/workspace"\n'
@@ -137,3 +138,66 @@ def test_instruction_must_be_utf8_and_present(tmp_path: Path) -> None:
     (task / "instruction.md").unlink()
     result = lint(task)["TG105"]
     assert (result.status, result.message) == (Status.SKIP, "instruction.md not found (see TG101)")
+
+
+MARKUP_ONLY = "instruction.md has no text, only headings and Markdown markup"
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        (
+            "# Title\n\n<!-- What must the agent produce? -->\n\n## Output\n\n- \n",
+            MARKUP_ONLY,
+        ),
+        ("# Title\n\n<!-- TODO -->\n\n---\n", MARKUP_ONLY),
+        ("# Title\n\n```\n```\n", MARKUP_ONLY),
+        ("# Title\n\n```python\n```\n", MARKUP_ONLY),
+        ("# Title\n\n> \n", MARKUP_ONLY),
+        ("# Title\n\n1.\n2)\n* [ ]\n- [x]\n", MARKUP_ONLY),
+        ("| | |\n| --- | --- |\n\n* * *\n", MARKUP_ONLY),
+        ("Word count\n==========\n", "instruction.md has only headings"),
+        ("Word count\nfor lines\n---\n\n## Output\n", "instruction.md has only headings"),
+        (
+            "# Word count\n\n<!-- Describe the task: input, output, format.\n",
+            "instruction.md has only headings",
+        ),
+    ],
+)
+def test_unfilled_templates_fail(tmp_path: Path, content: str, message: str) -> None:
+    """Regression: Markdown-only lines, setext headings and text inside an unclosed
+    comment counted as instruction text, so these templates passed TG105."""
+    task = make_task(tmp_path / "echo")
+    (task / "instruction.md").write_text(content, encoding="utf-8")
+    result = lint(task)["TG105"]
+    assert (result.status, result.message, result.blocking) == (Status.FAIL, message, True)
+
+
+@pytest.mark.parametrize(
+    ("content", "words"),
+    [
+        ("Word count\n==========\n\nCount the words.\n", 3),
+        ("# Task\n\n- Read input.txt\n- Write output.txt\n", 4),
+        ("1. Read the file.\n2) Sort it.\n- [x] done\n> Quoted text\n", 8),
+        ("Intro text.\n\n```sh\n# not a heading inside a fence\n```\n", 8),
+        ("```\nunclosed fence body\n", 3),
+        ("Some text\n***\n", 2),
+        ("- item\n---\n", 1),
+        ("Keep <!-- hidden --> this and <!--> that.\n", 4),
+        ("Before <!--->after.\n", 2),
+        ("Version 1.5 of the tool.\n", 5),
+    ],
+)
+def test_instruction_words_count_what_a_reader_sees(content: str, words: int) -> None:
+    assert read_instruction(content).words == words
+
+
+def test_comment_stripping_is_linear_on_unclosed_comments() -> None:
+    """Regression: a lazy <!--.*?--> regex took 1.1 s on 10,000 unclosed '<!--'."""
+    text = "<!--" * 200_000 + "\ntext\n"
+    started = time.perf_counter()
+    assert strip_comments(text) == ""
+    assert read_instruction(text).blank
+    assert time.perf_counter() - started < 1.0
+    assert strip_comments("a<!--b-->c<!--d") == "ac"
+    assert strip_comments("x <!-- a --> y <!-- b --> z") == "x  y  z"

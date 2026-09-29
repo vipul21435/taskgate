@@ -132,8 +132,18 @@ Gate TG104 warns when `timeout_sec` is valid but outside the recommended range,
 ## Instruction
 
 `instruction.md` is the prompt the agent receives. Gate TG105 fails when it is not
-UTF-8 or has no text once HTML comments and Markdown headings are removed (a
-template left with only `# Title` and `<!-- TODO -->` is empty).
+UTF-8 or has no words once what a reader would not see as text is removed:
+
+- HTML comments, including everything after an unclosed `<!--` (CommonMark hides
+  it too);
+- headings, both ATX (`# Title`) and setext (a paragraph underlined with `===` or
+  `---`);
+- bare Markdown markup: list bullets and numbers, `>` quote markers, `[ ]` task
+  boxes, thematic breaks (`---`, `* * *`), code-fence lines and table rules.
+
+A word is a whitespace-separated token with at least one letter or digit, so a
+template left with `# Title`, `<!-- TODO -->` and an empty bullet has no text.
+Lines inside a fenced code block do count: they are shown to the agent.
 
 ## Hygiene
 
@@ -173,7 +183,7 @@ matches `/` (`tests/data/*` covers every file below `tests/data/`).
 | TG102 | manifest-valid | yes | `task.toml` matches the schema above |
 | TG103 | manifest-known-keys | no (warning) | `task.toml` has no tables or keys outside the schema (skipped when it does not parse) |
 | TG104 | timeout-in-range | no (warning) | `timeout_sec` is inside the recommended range (skipped when it is invalid) |
-| TG105 | instruction-not-empty | yes | `instruction.md` is UTF-8 and has text beyond headings and comments (skipped when missing) |
+| TG105 | instruction-not-empty | yes | `instruction.md` is UTF-8 and has words beyond headings, comments and bare Markdown markup (skipped when missing) |
 | TG201 | no-secrets | yes | no text file holds a known token format, a private key or a high-entropy string |
 | TG202 | file-size-limits | yes | every file and the whole task are under the size limits |
 | TG203 | no-binary-files | yes | every binary file matches a `[files] binary_allow` glob |

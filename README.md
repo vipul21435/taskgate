@@ -34,7 +34,7 @@ answer should be) is the most common way a task goes wrong.
   | TG102 | manifest-valid | error | `task.toml` parses; `id` is kebab-case and equals the directory name; `difficulty`, `timeout_sec` (1..3600), `workdir` are valid; every problem is listed at once |
   | TG103 | manifest-known-keys | warning | no table or key outside the schema; each unknown one gets a did-you-mean hint with the qualified name |
   | TG104 | timeout-in-range | warning | `timeout_sec` is inside the recommended range (10..1800 s unless `[manifest]` says otherwise) |
-  | TG105 | instruction-not-empty | error | `instruction.md` is UTF-8 and has text beyond headings and HTML comments |
+  | TG105 | instruction-not-empty | error | `instruction.md` is UTF-8 and has words beyond headings (ATX and setext), HTML comments (an unclosed `<!--` hides the rest) and bare Markdown markup (empty bullets, rules, fences, `>`) |
   | TG201 | no-secrets | error | no text file holds a known token format (cloud key ids, source-host, chat, payment and `sk-` API keys, JSON web tokens), a private key header or a high-entropy string |
   | TG202 | file-size-limits | error | every file is under 1 MiB and the task under 10 MiB (`[files]`) |
   | TG203 | no-binary-files | error | every binary file (NUL in the first 8000 bytes) matches a `[files] binary_allow` glob |
@@ -177,7 +177,7 @@ tasks/integer-determinant  added  PASS
   pass  TG102  manifest-valid         manifest valid
   pass  TG103  manifest-known-keys    no unknown keys
   pass  TG104  timeout-in-range       task.timeout_sec 120 is within 10..1800
-  pass  TG105  instruction-not-empty  instruction.md has 90 words
+  pass  TG105  instruction-not-empty  instruction.md has 88 words
   pass  TG201  no-secrets             no secrets in 6 text files
   pass  TG202  file-size-limits       6 files, 3.5 KiB in total
   pass  TG203  no-binary-files        no binary files
@@ -308,7 +308,7 @@ modular-inverse  FAIL
   fail  TG103  manifest-known-keys    unknown in task.toml: task.timout_sec (did you mean task.timeout_sec?), [enviroment] (did you mean [environment]?)
         fix: Rename or remove the unknown keys; every key task.toml may hold is listed in docs/task-layout.md.
   skip  TG104  timeout-in-range       task.timeout_sec is missing or invalid (see TG102)
-  pass  TG105  instruction-not-empty  instruction.md has 109 words
+  pass  TG105  instruction-not-empty  instruction.md has 100 words
   ...
 result: FAIL, 1 blocking failure
 ```

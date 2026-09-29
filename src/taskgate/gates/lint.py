@@ -9,14 +9,112 @@ missing or does not parse; TG101 and TG102 already report that.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from taskgate.gates.base import Check, TaskContext, gate
 from taskgate.manifest import unknown_keys
 from taskgate.results import Severity
 
 INSTRUCTION = "instruction.md"
-_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-_HEADING = re.compile(r"^\s{0,3}#{1,6}(?:\s|$)")
+_ATX_HEADING = re.compile(r" {0,3}#{1,6}(?:[ \t]|$)")
+_SETEXT_UNDERLINE = re.compile(r" {0,3}(?:=+|-+)[ \t]*$")
+_FENCE = re.compile(r" {0,3}(`{3,}|~{3,})")
+_BLOCK_MARKER = re.compile(r"[ \t]*(?:>|(?:[-*+]|\d{1,9}[.)])(?=[ \t]|$))")
+_TASK_BOX = re.compile(r"[ \t]*\[[ xX]\](?=[ \t]|$)")
+
+
+def strip_comments(text: str) -> str:
+    """``text`` without HTML comments; an unclosed ``<!--`` hides everything after it.
+
+    Linear time (``str.find``), unlike a lazy ``<!--.*?-->`` regex, which rescans to
+    the end of the text from every unclosed ``<!--``. ``<!-->`` and ``<!--->`` are
+    complete comments, as in CommonMark.
+    """
+    kept: list[str] = []
+    position = 0
+    while (start := text.find("<!--", position)) >= 0:
+        kept.append(text[position:start])
+        end = text.find("-->", start + 2)
+        if end < 0:
+            return "".join(kept)
+        position = end + 3
+    kept.append(text[position:])
+    return "".join(kept)
+
+
+def _words(line: str) -> int:
+    """Words on a line: tokens with a letter or digit, after list, quote and task-box markers."""
+    position = 0
+    while marker := _BLOCK_MARKER.match(line, position):
+        position = marker.end()
+    if box := _TASK_BOX.match(line, position):
+        position = box.end()
+    return sum(any(char.isalnum() for char in token) for token in line[position:].split())
+
+
+def _closes(line: str, fence: str) -> bool:
+    """True when ``line`` closes a code block opened with ``fence`` (same character, as long)."""
+    body = line.strip()
+    indent = len(line) - len(line.lstrip(" "))
+    return indent <= 3 and len(body) >= len(fence) and set(body) == {fence[0]}
+
+
+@dataclass(frozen=True, slots=True)
+class InstructionText:
+    """What a reader of the rendered ``instruction.md`` would see."""
+
+    blank: bool
+    """Nothing but whitespace once HTML comments are removed."""
+
+    headings: int
+    words: int
+    """Tokens with a letter or digit outside headings, markers and fence lines."""
+
+    markup: int
+    """Non-blank lines with no words that are not headings (``-``, ``---``, fences, ``>``)."""
+
+
+def read_instruction(markdown: str) -> InstructionText:
+    """Count the words a Markdown instruction shows once comments, headings and markup go.
+
+    Headings are ATX (``# Title``) and setext (a paragraph underlined with ``===``
+    or ``---``). Lines inside fenced code blocks count as text; the fence lines do
+    not. List bullets, ordered-list numbers, ``>`` quote markers and ``[ ]`` task
+    boxes are not words, so a template with an empty bullet, a thematic break or
+    an empty code block has no text.
+    """
+    visible = strip_comments(markdown)
+    words = headings = markup = 0
+    paragraph: int | None = None  # words of the lines a setext underline would claim
+    fence: str | None = None
+    for line in visible.splitlines():
+        if fence is not None:
+            if _closes(line, fence):
+                fence = None
+                markup += 1
+            else:
+                words += _words(line)
+            continue
+        opened = _FENCE.match(line)
+        if opened:
+            fence, paragraph = opened.group(1), None
+            markup += 1
+        elif not line.strip():
+            paragraph = None
+        elif _ATX_HEADING.match(line):
+            headings, paragraph = headings + 1, None
+        elif paragraph is not None and _SETEXT_UNDERLINE.match(line):
+            words -= paragraph
+            headings, paragraph = headings + 1, None
+        else:
+            count = _words(line)
+            words += count
+            markup += count == 0
+            if count == 0 or _BLOCK_MARKER.match(line):
+                paragraph = None
+            else:
+                paragraph = (paragraph or 0) + count
+    return InstructionText(blank=not visible.strip(), headings=headings, words=words, markup=markup)
 
 
 @gate(
@@ -80,14 +178,14 @@ def instruction_not_empty(ctx: TaskContext) -> Check:
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError:
         return Check.fail("instruction.md is not valid UTF-8")
-    visible = _COMMENT.sub("", text)
-    if not visible.strip():
+    found = read_instruction(text)
+    if found.blank:
         return Check.fail("instruction.md is empty (or holds only comments)")
-    body = [line for line in visible.splitlines() if line.strip() and not _HEADING.match(line)]
-    if not body:
-        return Check.fail("instruction.md has only headings")
-    words = sum(len(line.split()) for line in body)
-    return Check.ok(f"instruction.md has {words} word{'' if words == 1 else 's'}")
+    if found.words == 0:
+        if found.markup == 0:
+            return Check.fail("instruction.md has only headings")
+        return Check.fail("instruction.md has no text, only headings and Markdown markup")
+    return Check.ok(f"instruction.md has {found.words} word{'' if found.words == 1 else 's'}")
 
 
 LINT_GATES = (manifest_known_keys, timeout_in_range, instruction_not_empty)

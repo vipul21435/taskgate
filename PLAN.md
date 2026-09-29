@@ -151,6 +151,14 @@ passes the same review gates before it is accepted.
     tree collects them. The local runner's copy now leaves out exactly the names
     the disk walk leaves out (it used to copy `.mypy_cache/`, `.ruff_cache/` and
     `.DS_Store`), so a run never uses a file the `--all` gates did not see.
+  - TG105 passed unfilled templates. It now counts words (tokens with a letter or
+    digit) after removing comments (an unclosed `<!--` hides the rest, as in
+    CommonMark), ATX and setext headings, list/quote/task-box markers and fence
+    lines, without a full Markdown parser: a line after a list item that a `---`
+    underlines is treated as a setext heading, which can undercount a few words
+    but only fails a file with no other text. Comment removal uses `str.find`,
+    so repeated unclosed `<!--` is linear. Sample word counts dropped (90 to 88,
+    109 to 100) because bullets and list numbers no longer count.
 
 ## Scaffold (done)
 
