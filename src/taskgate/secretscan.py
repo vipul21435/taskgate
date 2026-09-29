@@ -15,6 +15,11 @@ Three detectors run on every line:
    Hex digests never qualify (no upper case with lower case), and URLs and
    ``sha256=``/``sha512-`` digests are blanked out before this detector runs.
 
+Every pattern runs in time linear in the line length: a pattern that starts
+with a run of characters (a URL scheme, a JSON web token segment) is anchored
+at the start of that run with a lookbehind, so a long line of letters or hex
+(an ordinary input file) is not rescanned from every position.
+
 A line containing ``taskgate: allow-secret`` is skipped, and a finding whose text
 matches an allowlist regex is dropped. Findings never carry more than the first
 four characters of the matched text, so reports cannot leak the secret.
@@ -54,12 +59,14 @@ KNOWN_FORMATS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sk- API key", re.compile(r"\bsk-[A-Za-z0-9_-]{32,}")),
     (
         "JSON web token",
-        re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+        re.compile(
+            r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
+        ),
     ),
     (PRIVATE_KEY, re.compile(r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----")),
 )
 _BLANKED = re.compile(
-    r"[A-Za-z][A-Za-z0-9+.-]*://\S+"  # URLs
+    r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://\S+"  # URLs, anchored at the scheme's start
     r"|\bsha(?:1|224|256|384|512)[-=:][A-Za-z0-9+/_-]+={0,2}"  # lockfile and RECORD digests
 )
 

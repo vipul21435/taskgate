@@ -178,7 +178,13 @@ def _check_diff(
             change=task.change,
             results=()
             if task.change == "removed"
-            else run_gates(root / task.path, gates=registry.gates, config=config, runner=runner),
+            else run_gates(
+                root / task.path,
+                gates=registry.gates,
+                config=config,
+                runner=runner,
+                tracked=task.tracked,
+            ),
             changed_files=task.files,
         )
         for task in changes.tasks

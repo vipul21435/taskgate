@@ -41,6 +41,10 @@ class ChangedTask:
     files: tuple[str, ...]
     """Changed paths inside the task, relative to the repository root, sorted."""
 
+    tracked: tuple[str, ...] = ()
+    """Every path tracked at ``head`` inside the task, relative to the task, sorted
+    (empty for a removed task)."""
+
 
 @dataclass(frozen=True, slots=True)
 class ChangeSet:
@@ -144,7 +148,8 @@ def changed_tasks(repo: Path, base: str | None = None, head: str = "HEAD") -> Ch
         raise GitError(f"head ref not found: {head}")
     merge_base = git(repo, "merge-base", base_ref, head).strip()
     changed = _split_z(git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head))
-    head_roots = task_roots(tracked_files(repo, head))
+    head_files = tracked_files(repo, head)
+    head_roots = task_roots(head_files)
     base_roots = task_roots(tracked_files(repo, merge_base))
 
     grouped: dict[tuple[PurePosixPath, ChangeKind], list[str]] = {}
@@ -162,8 +167,19 @@ def changed_tasks(repo: Path, base: str | None = None, head: str = "HEAD") -> Ch
             kind = "removed"
         grouped.setdefault((root, kind), []).append(path)
 
+    touched = {root for root, kind in grouped if kind != "removed"}
+    contents: dict[PurePosixPath, list[str]] = {root: [] for root in touched}
+    for path in head_files:
+        owner = owning_task(path, head_roots)
+        if owner is not None and owner in touched:
+            contents[owner].append(PurePosixPath(path).relative_to(owner).as_posix())
     tasks = tuple(
-        ChangedTask(path=root, change=kind, files=tuple(sorted(files)))
+        ChangedTask(
+            path=root,
+            change=kind,
+            files=tuple(sorted(files)),
+            tracked=tuple(sorted(contents.get(root, ()))),
+        )
         for (root, kind), files in sorted(grouped.items(), key=lambda item: item[0][0].as_posix())
     )
     return ChangeSet(

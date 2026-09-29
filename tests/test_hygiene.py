@@ -2,6 +2,7 @@
 
 import random
 import string
+import time
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 from taskfactory import make_task
 from taskgate.config import Config, FileOptions, SecretOptions
 from taskgate.engine import run_gates
-from taskgate.gates.hygiene import HYGIENE_GATES, human_size
+from taskgate.gates.hygiene import HYGIENE_GATES, human_size, text_lines
 from taskgate.results import GateResult, Severity, Status
 from taskgate.secretscan import looks_random
 
@@ -31,8 +32,11 @@ def small_task(path: Path) -> Path:
     return make_task(path, dockerfile="FROM scratch\n")
 
 
-def hygiene(task: Path, config: Config | None = None) -> dict[str, GateResult]:
-    return {r.code: r for r in run_gates(task, gates=HYGIENE_GATES, config=config)}
+def hygiene(
+    task: Path, config: Config | None = None, tracked: list[str] | None = None
+) -> dict[str, GateResult]:
+    results = run_gates(task, gates=HYGIENE_GATES, config=config, tracked=tracked)
+    return {r.code: r for r in results}
 
 
 def write(task: Path, relative: str, content: str | bytes) -> None:
@@ -170,3 +174,98 @@ def test_binary_files_need_to_be_allowed(tmp_path: Path) -> None:
         Status.PASS,
         "2 binary files, all in [files] binary_allow",
     )
+
+
+def test_a_one_megabyte_input_line_is_scanned_in_seconds(tmp_path: Path) -> None:
+    """Regression: a 1,000,000-character one-line input took 673 s in TG201."""
+    task = small_task(tmp_path / "longest-palindrome")
+    rng = random.Random(7)
+    text = "".join(rng.choice("ab") for _ in range(1_000_000)) + "\n"
+    write(task, "environment/workspace/input/s.txt", text)
+    started = time.perf_counter()
+    results = hygiene(task)
+    assert time.perf_counter() - started < 10.0
+    assert {code: r.status for code, r in results.items()} == {
+        "TG201": Status.PASS,
+        "TG202": Status.PASS,
+        "TG203": Status.PASS,
+    }
+
+
+def test_the_secret_scan_reads_at_most_the_file_size_limit(tmp_path: Path) -> None:
+    task = small_task(tmp_path / "echo")
+    early, late = token(seed=5), token(seed=6)
+    write(task, "data/big.txt", f"{early}\n" + "x" * 3000 + f"\n{late}\n")
+    write(task, "data/one-line.txt", "y " * 2500 + late + "\n")
+    result = hygiene(task, Config(files=FileOptions(max_file_bytes=2048)))["TG201"]
+    assert result.message == (
+        f"1 likely secret: data/big.txt:1 high-entropy string '{early[:4]}...' (32 chars); "
+        "only the first 2.0 KiB of 2 larger files was scanned (see TG202)"
+    )
+    write(task, "data/big.txt", "z\n")
+    result = hygiene(task, Config(files=FileOptions(max_file_bytes=2048)))["TG201"]
+    assert (result.status, result.message) == (
+        Status.PASS,
+        "no secrets in 8 text files; only the first 2.0 KiB of 1 larger file was scanned "
+        "(see TG202)",
+    )
+    assert "late" not in result.message
+    assert hygiene(task)["TG201"].message.startswith("1 likely secret: data/one-line.txt:1 ")
+
+
+def test_text_lines_stop_at_the_budget(tmp_path: Path) -> None:
+    path = tmp_path / "f.txt"
+    path.write_bytes(b"ab\r\ncdef\nghij")
+    with path.open("rb") as handle:
+        assert list(text_lines(handle, 100)) == ["ab", "cdef", "ghij"]
+    with path.open("rb") as handle:
+        assert list(text_lines(handle, 6)) == ["ab", "cd"]
+    with path.open("rb") as handle:
+        assert list(text_lines(handle, 0)) == []
+
+
+def test_committed_files_named_like_caches_are_checked_in_diff_mode(tmp_path: Path) -> None:
+    """Regression: TG201-TG203 skipped committed __pycache__/, *.pyc, .DS_Store and
+    .mypy_cache/ files, so a secret, a 5 MiB .pyc and a hidden binary input passed."""
+    task = small_task(tmp_path / "echo")
+    key = "AKIA" + "".join(random.Random(3).choice(string.ascii_uppercase) for _ in range(16))
+    write(task, "solution/__pycache__/notes.txt", f"AWS_ACCESS_KEY_ID={key}\n")
+    write(task, "solution/.DS_Store", "-----BEGIN " + "RSA PRIVATE KEY-----\nabc\n")
+    write(task, "environment/workspace/model.pyc", b"\0" * (5 << 20))
+    write(task, "environment/workspace/input/.mypy_cache/blob.bin", b"\0\1" * (3 << 19))
+    on_disk = hygiene(task)
+    assert on_disk["TG201"].message == "no secrets in 6 text files"
+    tracked = [
+        "task.toml",
+        "instruction.md",
+        "environment/Dockerfile",
+        "environment/workspace/input/name.txt",
+        "environment/workspace/input/.mypy_cache/blob.bin",
+        "environment/workspace/model.pyc",
+        "solution/solve.sh",
+        "solution/.DS_Store",
+        "solution/__pycache__/notes.txt",
+        "tests/test_outputs.py",
+    ]
+    results = hygiene(task, tracked=tracked)
+    assert results["TG201"].message == (
+        "2 likely secrets: solution/.DS_Store:1 private key; "
+        "solution/__pycache__/notes.txt:1 AWS access key id 'AKIA...' (20 chars)"
+    )
+    assert results["TG202"].message == (
+        "2 files over the 1.0 MiB file limit: environment/workspace/model.pyc (5.0 MiB), "
+        "environment/workspace/input/.mypy_cache/blob.bin (3.0 MiB)"
+    )
+    assert results["TG203"].message == (
+        "2 binary files not in [files] binary_allow: "
+        "environment/workspace/input/.mypy_cache/blob.bin, environment/workspace/model.pyc"
+    )
+    assert all(result.blocking for result in results.values())
+
+
+def test_tracked_paths_that_are_not_regular_files_are_left_out(tmp_path: Path) -> None:
+    task = small_task(tmp_path / "echo")
+    (task / "link.txt").symlink_to(task / "instruction.md")
+    (task / "submodule").mkdir()
+    tracked = ["instruction.md", "link.txt", "submodule", "deleted-locally.txt", "task.toml"]
+    assert hygiene(task, tracked=tracked)["TG202"].message == "2 files, 190 B in total"

@@ -6,6 +6,7 @@ characters, so no literal token appears in this repository.
 
 import random
 import string
+import time
 
 import pytest
 
@@ -157,3 +158,36 @@ def test_describe_all_caps_the_list() -> None:
         "f:2 high-entropy string 'abcd...' (8 chars); and 5 more"
     )
     assert describe_all(findings[:1]) == "f:1 high-entropy string 'abcd...' (8 chars)"
+
+
+@pytest.mark.parametrize(
+    "unit",
+    [
+        "a",  # one long word, e.g. a string input for an algorithmic task
+        "0f3a",  # a hex blob
+        "ACGT",  # a DNA sequence
+        "a.b+c-",  # URL scheme characters with no "://"
+        "eyJ-",  # JSON web token prefixes with no dots
+        "hf_a",
+        "-----BEGIN A ",
+    ],
+)
+def test_a_one_megabyte_line_scans_in_linear_time(unit: str) -> None:
+    """Regression: the URL pattern was retried at every letter of a run (O(n^2)).
+
+    A 1,000,000-character line of letters took 673 s; it now takes well under a
+    second, and the patterns still find what they found before.
+    """
+    line = (unit * (1_000_000 // len(unit) + 1))[:1_000_000]
+    started = time.perf_counter()
+    assert Scanner().scan_line(line, "input/s.txt", 1) == []
+    assert time.perf_counter() - started < 2.0
+
+
+def test_anchored_patterns_still_blank_urls_and_find_tokens_mid_line() -> None:
+    token = flagged_token(32)
+    assert scan(f"see xhttps://example.com/{token} and ftp://h/{token}") == []
+    assert scan(f"url=https://example.com/{token}") == []
+    jwt = KNOWN["JSON web token"]
+    assert scan(f"Authorization: Bearer {jwt}") == [("JSON web token", jwt)]
+    assert scan(f"token={jwt}") == [("JSON web token", jwt)]

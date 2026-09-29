@@ -32,14 +32,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
-from taskgate.files import regular_files
+from taskgate.files import ignore_caches, regular_files
 
 OUTPUT_TAIL_LINES = 20
 PYTEST_NO_TESTS = 5
 PYTEST_ARGS: tuple[str, ...] = ("-m", "pytest", "-q", "-p", "no:cacheprovider")
 """Grader arguments after the interpreter; ``--rootdir``, ``-c`` and the tests dir follow."""
 SOLUTION_ENTRY = "solve.sh"
-_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 _DURATION = re.compile(r"\s+in\s+\d+(?:\.\d+)?s\b.*$")
 
 
@@ -212,7 +211,7 @@ def stage_solution(task_dir: Path, solution: Stub | Literal["reference"], dest: 
         dest.mkdir()
         (dest / SOLUTION_ENTRY).write_text(solution.script(), encoding="utf-8")
     else:
-        shutil.copytree(task_dir / "solution", dest, ignore=_IGNORE, symlinks=True)
+        shutil.copytree(task_dir / "solution", dest, ignore=ignore_caches, symlinks=True)
 
 
 def _files(root: Path) -> set[str]:
@@ -241,10 +240,10 @@ class LocalRunner:
             workspace = root / "workspace"
             seed = task_dir / "environment" / "workspace"
             if seed.is_dir():
-                shutil.copytree(seed, workspace, ignore=_IGNORE, symlinks=True)
+                shutil.copytree(seed, workspace, ignore=ignore_caches, symlinks=True)
             else:
                 workspace.mkdir()
-            shutil.copytree(task_dir / "tests", root / "tests", ignore=_IGNORE, symlinks=True)
+            shutil.copytree(task_dir / "tests", root / "tests", ignore=ignore_caches, symlinks=True)
             (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
 
             solution_exit: int | None = None

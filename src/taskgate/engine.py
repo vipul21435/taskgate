@@ -35,10 +35,20 @@ def run_gates(
     gates: Sequence[Gate] = BUILTIN_GATES,
     config: Config | None = None,
     runner: Runner | None = None,
+    tracked: Sequence[str] | None = None,
 ) -> tuple[GateResult, ...]:
-    """Run the enabled ``gates`` in order on ``task_dir``; one result per gate that ran."""
+    """Run the enabled ``gates`` in order on ``task_dir``; one result per gate that ran.
+
+    ``tracked`` lists the task's files as git tracks them (diff mode); see
+    :attr:`TaskContext.files`.
+    """
     config = config or Config()
-    ctx = TaskContext(task_dir=task_dir, runner=runner or LocalRunner(), config=config)
+    ctx = TaskContext(
+        task_dir=task_dir,
+        runner=runner or LocalRunner(),
+        config=config,
+        tracked=None if tracked is None else tuple(tracked),
+    )
     status: dict[str, Status] = {}
     results: list[GateResult] = []
     for gate in gates:

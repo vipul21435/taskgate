@@ -158,3 +158,22 @@ def test_execute_calls_the_timeout_hook_before_killing() -> None:
     done = execute(["sleep", "30"], timeout=0.2, on_timeout=lambda: called.append(True))
     assert done.code is None
     assert called == [True]
+
+
+def test_tool_caches_are_not_copied_into_a_run(tmp_path: Path, runner: LocalRunner) -> None:
+    """The local runner leaves out exactly what the on-disk walk (and so --all mode's
+    hygiene gates) leaves out, so a run never uses content no gate has seen."""
+    grader = (
+        "from pathlib import Path\n\n"
+        "def test_no_caches() -> None:\n"
+        "    found = sorted(p.as_posix() for p in Path().rglob('*') if p.is_file())\n"
+        "    assert found == ['input/name.txt', 'input/notes.txt']\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    workspace = task / "environment" / "workspace" / "input"
+    for relative in (".mypy_cache/x.json", ".ruff_cache/y", "__pycache__/z.pyc", ".DS_Store"):
+        (workspace / relative).parent.mkdir(parents=True, exist_ok=True)
+        (workspace / relative).write_text("cache\n", encoding="utf-8")
+    (workspace / "notes.txt").write_text("kept\n", encoding="utf-8")
+    result = runner.run(task, solution="none", timeout_sec=60)
+    assert result.grader_passed, result.output

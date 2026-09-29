@@ -16,7 +16,7 @@ from typing import Protocol, runtime_checkable
 
 from taskgate import manifest
 from taskgate.config import Config
-from taskgate.files import regular_files
+from taskgate.files import regular_files, tracked_regular_files
 from taskgate.results import Severity, Status
 from taskgate.runner import BuildResult, LocalRunner, Runner, RunResult, Solution
 
@@ -61,6 +61,10 @@ class TaskContext:
     task_dir: Path
     runner: Runner = field(default_factory=LocalRunner)
     config: Config = field(default_factory=Config)
+    tracked: tuple[str, ...] | None = None
+    """In diff mode, every path git tracks in the task at the checked commit
+    (relative to the task directory); ``None`` when a plain directory is checked."""
+
     _manifest: manifest.ManifestCheck | None = field(default=None, repr=False)
     _files: tuple[PurePosixPath, ...] | None = field(default=None, repr=False)
     _build: BuildResult | None = field(default=None, repr=False)
@@ -74,9 +78,19 @@ class TaskContext:
 
     @property
     def files(self) -> tuple[PurePosixPath, ...]:
-        """Regular files in the task, relative and sorted; caches and symlinks are left out."""
+        """The task's regular files, relative and sorted; symlinks are left out.
+
+        In diff mode these are the files git tracks, whatever their names, so a
+        committed ``__pycache__/`` file or ``.DS_Store`` is checked like any other.
+        Otherwise the directory is walked on disk, leaving out the tool caches a
+        working tree collects (see :mod:`taskgate.files`).
+        """
         if self._files is None:
-            self._files = regular_files(self.task_dir)
+            self._files = (
+                regular_files(self.task_dir)
+                if self.tracked is None
+                else tracked_regular_files(self.task_dir, self.tracked)
+            )
         return self._files
 
     def read_bytes(self, relative: PurePosixPath) -> bytes:

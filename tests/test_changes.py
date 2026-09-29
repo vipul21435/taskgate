@@ -14,6 +14,8 @@ from taskgate.changes import (
     task_roots,
 )
 
+TASK_FILES = ("instruction.md", "task.toml", "tests/test_x.py")
+
 
 def add_task(repo: GitRepo, path: str) -> None:
     repo.write(f"{path}/task.toml", "[task]\n")
@@ -78,6 +80,7 @@ def test_added_modified_and_removed_tasks(repo: GitRepo) -> None:
             path=PurePosixPath("tasks/kept"),
             change="modified",
             files=("tasks/kept/instruction.md",),
+            tracked=TASK_FILES,
         ),
         ChangedTask(
             path=PurePosixPath("tasks/new"),
@@ -87,7 +90,32 @@ def test_added_modified_and_removed_tasks(repo: GitRepo) -> None:
                 "tasks/new/task.toml",
                 "tasks/new/tests/test_x.py",
             ),
+            tracked=TASK_FILES,
         ),
+    )
+
+
+def test_tracked_lists_every_committed_file_whatever_its_name(repo: GitRepo) -> None:
+    repo.commit("base")
+    repo.branch("pr")
+    add_task(repo, "tasks/new")
+    repo.write("tasks/new/solution/__pycache__/notes.txt", "committed\n")
+    repo.write("tasks/new/.DS_Store", "committed\n")
+    repo.write("tasks/new/inner/task.toml", "[task]\n")
+    repo.write("tasks/new-sibling.txt", "not in the task\n")
+    repo.git("add", "-A", "-f")
+    repo.commit("pr")
+    repo.write("tasks/new/untracked.txt", "not committed\n")
+
+    (task,) = changed_tasks(repo.root, "main").tasks
+
+    assert task.tracked == (
+        ".DS_Store",
+        "inner/task.toml",
+        "instruction.md",
+        "solution/__pycache__/notes.txt",
+        "task.toml",
+        "tests/test_x.py",
     )
 
 

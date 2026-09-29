@@ -137,6 +137,21 @@ passes the same review gates before it is accepted.
   - Build failures are reported with the last build-log line, with BuildKit's
     per-build `ref <id>::<id>` blanked so reports stay stable.
 
+- **Review fixes (2026-09-30):**
+  - TG201 took quadratic time on long lines (673 s for one 977 KiB line): the
+    unanchored URL pattern was retried at every letter of a run. URL and JSON web
+    token patterns are now anchored at the start of their run with a lookbehind
+    (a JWT right after a `-` is no longer matched as a JWT; the entropy detector
+    still sees it), and TG201 reads at most `[files] max_file_bytes` of each file,
+    with bounded `readline` calls, noting a partial scan in its message. The cap
+    reuses TG202's limit instead of a new key: a larger file fails TG202 anyway.
+  - The hygiene gates dropped committed files named like tool caches. In diff mode
+    they now take the task's file list from `git ls-tree` at `HEAD` (no name
+    filter); `--all` keeps the disk walk that leaves caches out, since a working
+    tree collects them. The local runner's copy now leaves out exactly the names
+    the disk walk leaves out (it used to copy `.mypy_cache/`, `.ruff_cache/` and
+    `.DS_Store`), so a run never uses a file the `--all` gates did not see.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license

@@ -149,6 +149,43 @@ def test_check_skips_removed_tasks(repo: GitRepo) -> None:
     assert "tasks/old  removed  SKIP" in result.stdout
 
 
+def test_diff_mode_checks_committed_files_named_like_caches(repo: GitRepo) -> None:
+    """Regression: a pull request could commit a secret under __pycache__/, a private key
+    as .DS_Store, a 5 MiB .pyc and a 3 MiB binary under .mypy_cache/, and pass every gate."""
+    repo.write("README.md", "# Tasks\n")
+    repo.commit("base")
+    repo.branch("pr")
+    task = make_runnable_task(
+        repo.root / "tasks" / "echo",
+        solve="#!/bin/sh\nset -eu\ntest -s input/.mypy_cache/blob.bin\n"
+        "mkdir -p output\ncp input/name.txt output/greeting.txt\n",
+    )
+    key = "AKIA" + "QWERTYUIOPASDFGH"
+    (task / "solution" / "__pycache__").mkdir()
+    (task / "solution" / "__pycache__" / "notes.txt").write_text(f"AWS_ACCESS_KEY_ID={key}\n")
+    (task / "solution" / ".DS_Store").write_text("-----BEGIN " + "RSA PRIVATE KEY-----\n")
+    workspace = task / "environment" / "workspace"
+    (workspace / "model.pyc").write_bytes(b"\0" * (5 << 20))
+    (workspace / "input" / ".mypy_cache").mkdir()
+    (workspace / "input" / ".mypy_cache" / "blob.bin").write_bytes(b"\0\1" * (3 << 19))
+    repo.git("add", "-A", "-f")
+    repo.commit("add echo")
+
+    result = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--format", "json"])
+
+    assert result.exit_code == 1
+    (report,) = json.loads(result.stdout)["tasks"]
+    failed = {gate["code"]: gate["message"] for gate in report["gates"] if gate["status"] == "fail"}
+    assert failed["TG201"] == (
+        "2 likely secrets: solution/.DS_Store:1 private key; "
+        "solution/__pycache__/notes.txt:1 AWS access key id 'AKIA...' (20 chars)"
+    )
+    assert failed["TG202"].startswith("2 files over the 1.0 MiB file limit: ")
+    assert failed["TG203"].startswith("2 binary files not in [files] binary_allow: ")
+    assert failed["TG401"].startswith("solution/solve.sh exited 1")
+    assert key not in result.stdout
+
+
 def test_check_rejects_a_bad_base_and_a_non_repository(repo: GitRepo, tmp_path: Path) -> None:
     repo.commit("base")
     bad_base = runner.invoke(app, ["check", str(repo.root), "--base", "nope"])

@@ -1,16 +1,21 @@
 """Hygiene gates: no credentials (TG201), no oversized files (TG202) and no
 unreviewed binary files (TG203) anywhere in the task directory.
 
-They look at every file :attr:`TaskContext.files` lists (tool caches and
-symlinks are left out) and never need a runner. Options come from the
-``[secrets]`` and ``[files]`` sections of ``taskgate.toml``.
+They look at every file :attr:`TaskContext.files` lists (in diff mode every file
+git tracks in the task, whatever its name) and never need a runner. Options come
+from the ``[secrets]`` and ``[files]`` sections of ``taskgate.toml``.
+
+TG201 reads at most ``[files] max_file_bytes`` of each file: a bigger file
+already fails TG202, and the cap keeps one huge file from holding up the run
+before TG202 gets to report it.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from fnmatch import fnmatchcase
 from pathlib import PurePosixPath
+from typing import BinaryIO
 
 from taskgate.gates.base import BINARY_SNIFF_BYTES, Check, TaskContext, gate, is_binary
 from taskgate.results import Severity
@@ -50,6 +55,20 @@ def _head(ctx: TaskContext, path: PurePosixPath) -> bytes:
         return handle.read(BINARY_SNIFF_BYTES)
 
 
+def text_lines(handle: BinaryIO, budget: int) -> Iterator[str]:
+    """Lines of ``handle`` without line endings, decoded, until ``budget`` bytes are read.
+
+    A line longer than what is left of the budget is cut at the budget, so memory
+    and time stay bounded however long the file's lines are.
+    """
+    while budget > 0:
+        raw = handle.readline(budget)
+        if not raw:
+            return
+        budget -= len(raw)
+        yield raw.rstrip(b"\r\n").decode("utf-8", "replace")
+
+
 @gate(
     "TG201",
     "no-secrets",
@@ -63,13 +82,14 @@ def _head(ctx: TaskContext, path: PurePosixPath) -> bytes:
 )
 def no_secrets(ctx: TaskContext) -> Check:
     options = ctx.config.secrets
+    cap = ctx.config.files.max_file_bytes
     scanner = Scanner(
         min_length=options.min_length,
         entropy_threshold=options.entropy_threshold,
         allow=options.allow,
     )
     findings: list[Finding] = []
-    scanned = 0
+    scanned = partly = 0
     for path in ctx.files:
         if matches_any(path, options.exclude):
             continue
@@ -78,13 +98,19 @@ def no_secrets(ctx: TaskContext) -> Check:
                 continue
             handle.seek(0)
             scanned += 1
-            lines = (raw.rstrip(b"\r\n").decode("utf-8", "replace") for raw in handle)
-            findings.extend(scanner.scan_lines(lines, path.as_posix()))
+            partly += (ctx.task_dir / path).stat().st_size > cap
+            findings.extend(scanner.scan_lines(text_lines(handle, cap), path.as_posix()))
+    note = (
+        f"; only the first {human_size(cap)} of {_plural(partly, 'larger file')} "
+        "was scanned (see TG202)"
+        if partly
+        else ""
+    )
     if findings:
         return Check.fail(
-            f"{_plural(len(findings), 'likely secret')}: {describe_all(findings, LISTED)}"
+            f"{_plural(len(findings), 'likely secret')}: {describe_all(findings, LISTED)}{note}"
         )
-    return Check.ok(f"no secrets in {_plural(scanned, 'text file')}")
+    return Check.ok(f"no secrets in {_plural(scanned, 'text file')}{note}")
 
 
 @gate(

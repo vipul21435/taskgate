@@ -53,7 +53,16 @@ answer should be) is the most common way a task goes wrong.
   English bigrams, the last of which keeps long identifiers such as
   `PyUnicode_AsLatin1String` out. URLs and `sha256=`/`sha512-` digests are
   blanked first. A `taskgate: allow-secret` comment, `[secrets] allow` regexes
-  and `exclude` globs handle false positives.
+  and `exclude` globs handle false positives. Every pattern is linear in the
+  line length (patterns that start with a run of characters are anchored at
+  the run's start), and TG201 reads at most `[files] max_file_bytes` of a file,
+  so a 1,000,000-character one-line input scans in well under a second.
+- **Hygiene gates see what the pull request commits.** In diff mode TG201-TG203
+  check every file git tracks in the task at `HEAD`, whatever its name, so a
+  committed `__pycache__/` file, `*.pyc`, `.DS_Store` or `.mypy_cache/` entry
+  cannot slip past them. `--all` walks the directory on disk and leaves those
+  tool caches out, and the local runner leaves out the same names when it copies
+  a task.
 - **A Docker runner** (`--runner docker`, or `auto` when `docker version`
   answers). It builds `environment/Dockerfile` under a tag derived from the build
   context's content (`taskgate-env:<16 hex>`, labelled `project=taskgate`) and
@@ -381,6 +390,7 @@ flowchart LR
 | Secret-scan false positives | `uv run python examples/secret_survey.py scan .venv/lib/python3.12/site-packages` | 0 findings in 2523 text files, 689,539 lines of the locked dependencies (macOS arm64), 4.3 s |
 | Secret-scan recall | `uv run python examples/secret_survey.py recall` | 2000 seeded random base64 tokens per length: 24 chars 0.8905, 32 chars 0.9665, 40 chars 0.9720, 64 chars 0.9975 |
 | Secret scan on the samples | `uv run python examples/secret_survey.py scan examples` | 1 finding: the key planted in the bad demo pull request |
+| Secret scan, one long line | `uv run python examples/secret_survey.py timing` | 0.002 s at 20,000 characters, 0.009 s at 80,000 and 0.109 s at 1,000,000, the same for a run of one letter, random `a`/`b`, hex and DNA; before the URL pattern was anchored, 20,000 and 40,000 letters took 0.275 s and 1.094 s (quadratic) |
 
 ## Design decisions
 
@@ -506,7 +516,7 @@ TG403) are built (see above); the rest is not built yet:
 | `make test-docker` | the opt-in tests against a real Docker daemon (`TASKGATE_DOCKER_TESTS=1 uv run pytest -m docker`) |
 | `make clean-images` | remove the `taskgate-env:*` task images the Docker runner built |
 | `make docker` | build the image, run the demo in it, prune this project's dangling images |
-| `uv run python examples/secret_survey.py scan DIR` / `recall` | the secret-scan false-positive and recall measurements above |
+| `uv run python examples/secret_survey.py scan DIR` / `recall` / `timing` | the secret-scan false-positive, recall and long-line timing measurements above |
 
 ## License
 

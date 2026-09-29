@@ -137,8 +137,15 @@ template left with only `# Title` and `<!-- TODO -->` is empty).
 
 ## Hygiene
 
-Every file in the task (tool caches such as `__pycache__/` and symlinks are left
-out) is checked by three gates; the limits live in `taskgate.toml`:
+Three gates check every file in the task; the limits live in `taskgate.toml`.
+In diff mode "every file" means every file git tracks in the task at `HEAD`,
+whatever its name, so a committed `__pycache__/` file, `*.pyc`, `.DS_Store` or
+`.mypy_cache/` entry is checked like any other. With `--all` the directory is
+walked on disk instead, and the tool caches a working tree collects
+(`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `*.pyc`,
+`.DS_Store`) are left out; the local runner leaves out the same names when it
+copies a task, so a run never uses a file those gates did not see. Symlinks are
+left out in both modes.
 
 - **TG201** scans every text file for credentials: known token formats (cloud
   access key ids, source-host, chat, payment and `sk-` style API keys, JSON web
@@ -146,7 +153,10 @@ out) is checked by three gates; the limits live in `taskgate.toml`:
   `src/taskgate/secretscan.py` for the exact rule). Messages show only the first
   four characters of a match. A line containing `taskgate: allow-secret` is
   skipped; `[secrets] allow` (regexes on the matched text) and `exclude` (path
-  globs) cover the rest.
+  globs) cover the rest. Every pattern runs in time linear in the line length,
+  and at most `[files] max_file_bytes` of each file is read (a bigger file
+  fails TG202, and the message says it was scanned in part), so one long line or
+  one huge file cannot stall the run.
 - **TG202** fails a file over `[files] max_file_bytes` (default 1 MiB) or a task
   over `max_task_bytes` (default 10 MiB) in total.
 - **TG203** fails a binary file (a NUL byte in its first 8000 bytes, git's rule)
