@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Protocol, runtime_checkable
 
 from taskgate import manifest
+from taskgate.config import Config
 from taskgate.results import Severity, Status
 from taskgate.runner import LocalRunner, Runner, RunResult
 
@@ -65,6 +66,7 @@ class TaskContext:
 
     task_dir: Path
     runner: Runner = field(default_factory=LocalRunner)
+    config: Config = field(default_factory=Config)
     _manifest: manifest.ManifestCheck | None = field(default=None, repr=False)
     _files: tuple[PurePosixPath, ...] | None = field(default=None, repr=False)
 

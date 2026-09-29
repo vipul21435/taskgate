@@ -52,6 +52,12 @@ goes wrong.
   [examples/plugin](examples/plugin) is a working example (TG701). A plugin that
   fails to load or breaks the contract stops the run with exit code 2, and a gate
   that raises is reported as a failure instead of hiding the other results.
+- **`taskgate.toml`** turns gates off (`[gates] disable = [...]`) or changes their
+  severity (`[gates.severity] TG402 = "warning"`). Unknown sections, keys and gate
+  codes are errors (exit 2). In diff mode the file is read from the base ref
+  (`git show main:taskgate.toml`), so a pull request cannot relax the gates that
+  check it; `--config PATH` overrides that. Reports name the config source and
+  every override.
 - `taskgate tasks [ROOT]` lists task directories and the layout parts each lacks.
 - A digest-pinned Docker image (non-root user, git included) that runs the CLI
   and the demo, and GitHub Actions CI that runs lint, mypy, the tests with a
@@ -73,8 +79,8 @@ command exits 1 on purpose: the bundled draft task is incomplete.
 ## Usage
 
 ```
-taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json]
-taskgate gates [--json]
+taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json] [--config FILE]
+taskgate gates [ROOT] [--json] [--config FILE]
 taskgate tasks [ROOT] [--json] [--strict]
 taskgate version
 ```
@@ -160,6 +166,7 @@ flowchart LR
 | `manifest.py` | `task.toml` parsing and schema validation that collects every problem |
 | `runner.py` | the `Runner` protocol and the local subprocess runner |
 | `gates/` | the `Gate` protocol, `TaskContext`, the `@gate` decorator and the built-in gates |
+| `config.py` | `taskgate.toml` parsing and validation (every problem at once) |
 | `registry.py` | built-in plus entry-point gates, validated and sorted by code |
 | `engine.py` | `run_gates`: runs gates in code order, skips unmet `requires`, contains gate crashes |
 | `report.py` | pure renderers from a `CheckReport` to text, Markdown and JSON |

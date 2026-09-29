@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -10,7 +11,8 @@ from typing import Annotated
 import typer
 
 from taskgate import __version__
-from taskgate.changes import GitError, changed_tasks, repo_root
+from taskgate.changes import GitError, changed_tasks, read_file_at, repo_root
+from taskgate.config import CONFIG_FILE, Config, ConfigError, discover, load_file, parse
 from taskgate.engine import run_gates
 from taskgate.layout import TaskDir, find_tasks
 from taskgate.registry import (
@@ -21,7 +23,7 @@ from taskgate.registry import (
     group_of,
     load_registry,
 )
-from taskgate.report import to_json, to_markdown, to_text
+from taskgate.report import describe_config, to_json, to_markdown, to_text
 from taskgate.results import CheckReport, TaskReport
 
 app = typer.Typer(
@@ -105,35 +107,55 @@ def _registry() -> Registry:
         raise _fail_usage(str(exc)) from exc
 
 
-def _check_all(root: Path) -> CheckReport:
+def _config(registry: Registry, path: Path | None, fallback: Callable[[], Config]) -> Config:
+    """``--config PATH`` when given, else ``fallback()``; unknown gate codes are errors."""
+    try:
+        config = load_file(path) if path is not None else fallback()
+        config.validate_codes(registry.codes)
+    except (ConfigError, GitError) as exc:
+        raise _fail_usage(str(exc)) from exc
+    return config
+
+
+def _config_at(root: Path, ref: str) -> Config:
+    """``taskgate.toml`` as committed at ``ref`` (the defaults when it is not there)."""
+    text = read_file_at(root, ref, CONFIG_FILE)
+    return Config() if text is None else parse(text, f"{CONFIG_FILE} at {ref}")
+
+
+def _check_all(root: Path, config_path: Path | None) -> CheckReport:
     try:
         found = find_tasks(root)
     except NotADirectoryError as exc:
         raise _fail_usage(str(exc)) from exc
-    gates = _registry().gates
+    registry = _registry()
+    config = _config(registry, config_path, lambda: discover(root))
     tasks = tuple(
         TaskReport(
             path=task.path.as_posix(),
             change=None,
-            results=run_gates(root / task.path, gates=gates),
+            results=run_gates(root / task.path, gates=registry.gates, config=config),
         )
         for task in found
     )
-    return CheckReport(version=__version__, mode="all", tasks=tasks)
+    return CheckReport(version=__version__, mode="all", tasks=tasks, config=config.summary())
 
 
-def _check_diff(repo: Path, base: str | None) -> CheckReport:
+def _check_diff(repo: Path, base: str | None, config_path: Path | None) -> CheckReport:
     try:
         root = repo_root(repo)
         changes = changed_tasks(root, base)
     except GitError as exc:
         raise _fail_usage(str(exc)) from exc
-    gates = _registry().gates
+    registry = _registry()
+    config = _config(registry, config_path, lambda: _config_at(root, changes.base))
     tasks = tuple(
         TaskReport(
             path=task.path.as_posix(),
             change=task.change,
-            results=() if task.change == "removed" else run_gates(root / task.path, gates=gates),
+            results=()
+            if task.change == "removed"
+            else run_gates(root / task.path, gates=registry.gates, config=config),
             changed_files=task.files,
         )
         for task in changes.tasks
@@ -145,7 +167,20 @@ def _check_diff(repo: Path, base: str | None) -> CheckReport:
         merge_base=changes.merge_base,
         tasks=tasks,
         other_files=changes.other_files,
+        config=config.summary(),
     )
+
+
+ConfigOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--config",
+        help=(
+            "taskgate.toml to use. Default: the one committed at the base ref (diff mode) "
+            "or in the checked directory (--all)."
+        ),
+    ),
+]
 
 
 @app.command()
@@ -169,12 +204,17 @@ def check(
     output_format: Annotated[
         OutputFormat, typer.Option("--format", help="What to print on stdout.")
     ] = OutputFormat.TEXT,
+    config_path: ConfigOption = None,
 ) -> None:
     """Run the review gates on the tasks a pull request changes.
 
     Exits 0 when no blocking gate fails, 1 when one does, and 2 on usage errors.
     """
-    report = _check_all(repo.resolve()) if all_tasks else _check_diff(repo, base)
+    report = (
+        _check_all(repo.resolve(), config_path)
+        if all_tasks
+        else _check_diff(repo, base, config_path)
+    )
     typer.echo(RENDERERS[output_format](report), nl=False)
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
@@ -185,13 +225,15 @@ def check(
         raise typer.Exit(1)
 
 
-def _gate_json(registry: Registry) -> list[dict[str, object]]:
+def _gate_json(registry: Registry, config: Config) -> list[dict[str, object]]:
     return [
         {
             "code": entry.gate.code,
             "name": entry.gate.name,
             "group": GROUPS[group_of(entry.gate.code)],
-            "severity": entry.gate.severity.value,
+            "enabled": entry.gate.code not in config.disabled,
+            "severity": config.severity_for(entry.gate.code, entry.gate.severity).value,
+            "default_severity": entry.gate.severity.value,
             "summary": entry.gate.summary,
             "fix_hint": entry.gate.fix_hint,
             "requires": list(entry.gate.requires),
@@ -201,7 +243,7 @@ def _gate_json(registry: Registry) -> list[dict[str, object]]:
     ]
 
 
-def _gate_lines(registry: Registry) -> list[str]:
+def _gate_lines(registry: Registry, config: Config) -> list[str]:
     entries = registry.entries
     name_width = max(len(entry.gate.name) for entry in entries)
     lines: list[str] = []
@@ -211,26 +253,41 @@ def _gate_lines(registry: Registry) -> list[str]:
         if group_of(gate.code) != group:
             group = group_of(gate.code)
             lines.append(group_label(group))
+        severity = (
+            "off"
+            if gate.code in config.disabled
+            else config.severity_for(gate.code, gate.severity).value
+        )
         source = "" if entry.builtin else f"  [{entry.source}]"
         lines.append(
-            f"  {gate.code}  {gate.severity.value:<7}  {gate.name:<{name_width}}  "
-            f"{gate.summary}{source}"
+            f"  {gate.code}  {severity:<7}  {gate.name:<{name_width}}  {gate.summary}{source}"
         )
     builtin = len(entries) - registry.plugin_count
     lines.append(f"{len(entries)} gates: {builtin} built-in, {registry.plugin_count} from plugins")
+    described = describe_config(config.summary())
+    if described:
+        lines.append(f"config: {described}")
     return lines
 
 
 @app.command()
 def gates(
+    root: Annotated[
+        Path, typer.Argument(help="Directory whose taskgate.toml applies (if it has one).")
+    ] = Path(),
     as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead of text.")] = False,
+    config_path: ConfigOption = None,
 ) -> None:
-    """List every gate code with its severity, name and what it checks."""
+    """List every gate code with its effective severity, name and what it checks.
+
+    A gate that taskgate.toml disables is shown with severity "off".
+    """
     registry = _registry()
+    config = _config(registry, config_path, lambda: discover(root))
     if as_json:
-        typer.echo(json.dumps(_gate_json(registry), indent=2))
+        typer.echo(json.dumps(_gate_json(registry, config), indent=2))
     else:
-        typer.echo("\n".join(_gate_lines(registry)))
+        typer.echo("\n".join(_gate_lines(registry, config)))
 
 
 def main() -> None:

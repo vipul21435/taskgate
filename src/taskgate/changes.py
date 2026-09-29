@@ -122,6 +122,13 @@ def tracked_files(repo: Path, ref: str) -> list[str]:
     return _split_z(git(repo, "ls-tree", "-r", "-z", "--name-only", ref))
 
 
+def read_file_at(repo: Path, ref: str, path: str) -> str | None:
+    """Return the text of ``path`` at ``ref``, or ``None`` when it is not tracked there."""
+    if not git(repo, "ls-tree", "--name-only", ref, "--", path).strip():
+        return None
+    return git(repo, "show", f"{ref}:{path}")
+
+
 def owning_task(path: str, roots: frozenset[PurePosixPath]) -> PurePosixPath | None:
     """Return the outermost task directory in ``roots`` that contains ``path``."""
     for ancestor in reversed(PurePosixPath(path).parents):

@@ -211,7 +211,9 @@ def test_gates_json(monkeypatch: pytest.MonkeyPatch) -> None:
         "code": "TG803",
         "name": "pair-two",
         "group": "third-party",
+        "enabled": True,
         "severity": "warning",
+        "default_severity": "warning",
         "summary": "a plugin gate",
         "fix_hint": "fix it",
         "requires": ["TG802"],
@@ -238,3 +240,108 @@ def test_plugin_gates_run_in_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     (task,) = json.loads(result.stdout)["tasks"]
     assert task["gates"][-1]["code"] == "TG808"
     assert task["gates"][-1]["message"] == "checked echo"
+
+
+LOOSE_CONFIG = """\
+[gates]
+disable = ["TG101"]
+
+[gates.severity]
+TG402 = "warning"
+"""
+
+
+def test_check_all_reads_taskgate_toml_from_the_checked_directory(tmp_path: Path) -> None:
+    make_runnable_task(tmp_path / "tasks" / "echo", grader=LENIENT_GRADER)
+    (tmp_path / "taskgate.toml").write_text(
+        '[gates.severity]\nTG402 = "warning"\n', encoding="utf-8"
+    )
+    result = runner.invoke(app, ["check", "--all", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[1] == "config: taskgate.toml; severity TG402=warning"
+    assert "  fail  TG402  baseline-fails" in result.stdout
+
+
+def test_diff_mode_takes_the_config_from_the_base_not_the_pull_request(repo: GitRepo) -> None:
+    make_runnable_task(repo.root / "tasks" / "accepted")
+    repo.commit("base")
+    repo.branch("pr")
+    make_runnable_task(repo.root / "tasks" / "echo", grader=LENIENT_GRADER)
+    repo.write("taskgate.toml", LOOSE_CONFIG)
+    repo.commit("add echo and relax the gates")
+    blocked = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--format", "json"])
+    assert blocked.exit_code == 1
+    data = json.loads(blocked.stdout)
+    assert data["config"] == {"source": None, "disabled": [], "severity": {}}
+    assert data["other_files"] == ["taskgate.toml"]
+
+    repo.checkout("main")
+    repo.write("taskgate.toml", '[gates.severity]\nTG402 = "warning"\n')
+    repo.commit("policy: baseline gate warns")
+    repo.checkout("pr")
+    relaxed = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--format", "json"])
+    assert relaxed.exit_code == 0, relaxed.output
+    config = json.loads(relaxed.stdout)["config"]
+    assert config == {
+        "source": "taskgate.toml at main",
+        "disabled": [],
+        "severity": {"TG402": "warning"},
+    }
+
+
+def test_explicit_config_disables_gates_and_skips_their_dependents(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    pr_repo(repo, grader=LENIENT_GRADER)
+    config = tmp_path / "loose.toml"
+    config.write_text(LOOSE_CONFIG, encoding="utf-8")
+    result = runner.invoke(
+        app, ["check", str(repo.root), "--base", "main", "--config", str(config)]
+    )
+    assert result.exit_code == 0, result.output
+    assert f"config: {config}; disabled TG101; severity TG402=warning" in result.stdout
+    assert "  TG101  " not in result.stdout
+    assert "skip  TG401  solution-passes  skipped: requires TG101 (disabled) to pass" in (
+        result.stdout
+    )
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("[gates]\ndisable = ['TG999']\n", "unknown gate code(s): TG999"),
+        ("[gates\n", "does not parse"),
+        ("[gate]\n", "unknown section [gate]"),
+    ],
+)
+def test_a_bad_config_is_a_usage_error(tmp_path: Path, content: str, message: str) -> None:
+    (tmp_path / "taskgate.toml").write_text(content, encoding="utf-8")
+    for args in (["check", "--all", str(tmp_path)], ["gates", str(tmp_path)]):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2
+        assert message in result.output
+
+
+def test_gates_shows_the_effective_severity(tmp_path: Path) -> None:
+    config = tmp_path / "taskgate.toml"
+    config.write_text(LOOSE_CONFIG, encoding="utf-8")
+    result = runner.invoke(app, ["gates", str(tmp_path)])
+    assert result.exit_code == 0
+    assert "  TG101  off      layout-complete" in result.output
+    assert "  TG402  warning  baseline-fails" in result.output
+    assert result.output.splitlines()[-1] == (
+        "config: taskgate.toml; disabled TG101; severity TG402=warning"
+    )
+    data = json.loads(runner.invoke(app, ["gates", "--json", "--config", str(config)]).output)
+    by_code = {gate["code"]: gate for gate in data}
+    assert by_code["TG101"]["enabled"] is False
+    assert (by_code["TG402"]["severity"], by_code["TG402"]["default_severity"]) == (
+        "warning",
+        "error",
+    )
+
+
+def test_a_missing_config_file_is_a_usage_error(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["gates", "--config", str(tmp_path / "nope.toml")])
+    assert result.exit_code == 2
+    assert "cannot read" in result.output

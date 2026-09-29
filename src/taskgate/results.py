@@ -74,6 +74,18 @@ class TaskReport:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigSummary:
+    """What ``taskgate.toml`` changed, as reports show it."""
+
+    source: str | None = None
+    """``taskgate.toml at main``, a ``--config`` path, or ``None`` for the defaults."""
+
+    disabled: tuple[str, ...] = ()
+    severity: tuple[tuple[str, Severity], ...] = ()
+    """``(code, severity)`` pairs that override a gate's default severity."""
+
+
+@dataclass(frozen=True, slots=True)
 class CheckReport:
     """The outcome of one ``taskgate check`` run."""
 
@@ -85,6 +97,7 @@ class CheckReport:
     merge_base: str | None = None
     tasks: tuple[TaskReport, ...] = ()
     other_files: tuple[str, ...] = field(default=())
+    config: ConfigSummary = field(default_factory=ConfigSummary)
 
     @property
     def blocking_failures(self) -> int:

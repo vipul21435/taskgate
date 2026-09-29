@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from taskgate.results import CheckReport, GateResult, Status, TaskReport
+from taskgate.results import CheckReport, ConfigSummary, GateResult, Status, TaskReport
 
 SHORT_SHA = 7
 
@@ -31,6 +31,19 @@ def _scope(report: CheckReport) -> str:
     return scope
 
 
+def describe_config(config: ConfigSummary) -> str | None:
+    """One line naming the config file and what it changes; ``None`` for the defaults."""
+    if config.source is None:
+        return None
+    parts = [config.source]
+    if config.disabled:
+        parts.append(f"disabled {', '.join(config.disabled)}")
+    if config.severity:
+        overrides = ", ".join(f"{code}={severity.value}" for code, severity in config.severity)
+        parts.append(f"severity {overrides}")
+    return "; ".join(parts)
+
+
 def _result_line(report: CheckReport) -> str:
     verdict = "PASS" if report.passed else "FAIL"
     return f"{verdict}, {_plural(report.blocking_failures, 'blocking failure')}"
@@ -44,6 +57,9 @@ def _task_header(task: TaskReport) -> str:
 def to_text(report: CheckReport) -> str:
     """Human-readable summary for the terminal."""
     lines = [f"taskgate {report.version}: {_scope(report)}"]
+    config = describe_config(report.config)
+    if config:
+        lines.append(f"config: {config}")
     if not report.tasks:
         lines.append("no task directories to check")
     for task in report.tasks:
@@ -84,6 +100,9 @@ def to_markdown(report: CheckReport) -> str:
         f"{_plural(report.blocking_failures, 'blocking failure')}; {_scope(report)}.",
         "",
     ]
+    config = describe_config(report.config)
+    if config:
+        lines += [f"Config: {config}.", ""]
     if not report.tasks:
         lines += ["No task directories to check.", ""]
     else:
@@ -147,6 +166,11 @@ def to_dict(report: CheckReport) -> dict[str, Any]:
             for task in report.tasks
         ],
         "other_files": list(report.other_files),
+        "config": {
+            "source": report.config.source,
+            "disabled": list(report.config.disabled),
+            "severity": {code: severity.value for code, severity in report.config.severity},
+        },
     }
 
 

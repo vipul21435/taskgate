@@ -1,9 +1,11 @@
 """Run a sequence of gates on one task directory and collect their results.
 
-Gates run in the order given (the registry sorts them by code). A gate whose
-``requires`` did not all pass is reported as skipped instead of producing a
-second, misleading failure. A gate that raises is reported as a failure with
-the exception, so one broken third-party gate cannot hide the other results.
+Gates run in the order given (the registry sorts them by code). Gates that
+``taskgate.toml`` disables do not run and are not reported; severity overrides
+replace a gate's default. A gate whose ``requires`` did not all pass (including
+a disabled requirement) is reported as skipped instead of producing a second,
+misleading failure. A gate that raises is reported as a failure with the
+exception, so one broken third-party gate cannot hide the other results.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from pathlib import Path
 
+from taskgate.config import Config
 from taskgate.gates import BUILTIN_GATES, Check, Gate, TaskContext
 from taskgate.results import GateResult, Status
 from taskgate.runner import LocalRunner, Runner
@@ -30,14 +33,22 @@ def run_gates(
     task_dir: Path,
     *,
     gates: Sequence[Gate] = BUILTIN_GATES,
+    config: Config | None = None,
     runner: Runner | None = None,
 ) -> tuple[GateResult, ...]:
-    """Run ``gates`` in order on ``task_dir`` and return one result per gate."""
-    ctx = TaskContext(task_dir=task_dir, runner=runner or LocalRunner())
+    """Run the enabled ``gates`` in order on ``task_dir``; one result per gate that ran."""
+    config = config or Config()
+    ctx = TaskContext(task_dir=task_dir, runner=runner or LocalRunner(), config=config)
     status: dict[str, Status] = {}
     results: list[GateResult] = []
     for gate in gates:
-        unmet = [code for code in gate.requires if status.get(code) is not Status.PASS]
+        if gate.code in config.disabled:
+            continue
+        unmet = [
+            f"{code} (disabled)" if code in config.disabled else code
+            for code in gate.requires
+            if status.get(code) is not Status.PASS
+        ]
         outcome = (
             Check.skip(f"skipped: requires {', '.join(unmet)} to pass")
             if unmet
@@ -46,7 +57,7 @@ def run_gates(
         result = GateResult(
             code=gate.code,
             name=gate.name,
-            severity=gate.severity,
+            severity=config.severity_for(gate.code, gate.severity),
             status=outcome.status,
             message=outcome.message,
             fix_hint=gate.fix_hint if outcome.status is Status.FAIL else None,

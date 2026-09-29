@@ -1,7 +1,14 @@
 import json
 
-from taskgate.report import to_dict, to_json, to_markdown, to_text
-from taskgate.results import CheckReport, GateResult, Severity, Status, TaskReport
+from taskgate.report import describe_config, to_dict, to_json, to_markdown, to_text
+from taskgate.results import (
+    CheckReport,
+    ConfigSummary,
+    GateResult,
+    Severity,
+    Status,
+    TaskReport,
+)
 
 PASS_101 = GateResult("TG101", "layout-complete", Severity.ERROR, Status.PASS, "layout complete")
 FAIL_402 = GateResult(
@@ -95,3 +102,22 @@ def test_json_report_round_trips_and_is_stable() -> None:
     }
     assert data["other_files"] == ["README.md"]
     assert to_json(REPORT) == to_json(REPORT)
+
+
+def test_config_is_named_in_every_format() -> None:
+    config = ConfigSummary(source="taskgate.toml at main", disabled=("TG104", "TG203"))
+    report = CheckReport(version="9.9.9", mode="all", config=config)
+    assert describe_config(config) == "taskgate.toml at main; disabled TG104, TG203"
+    assert to_text(report).splitlines()[1] == "config: taskgate.toml at main; disabled TG104, TG203"
+    assert "Config: taskgate.toml at main; disabled TG104, TG203.\n" in to_markdown(report)
+    assert to_dict(report)["config"] == {
+        "source": "taskgate.toml at main",
+        "disabled": ["TG104", "TG203"],
+        "severity": {},
+    }
+
+
+def test_default_config_adds_no_lines() -> None:
+    assert describe_config(ConfigSummary()) is None
+    assert "config" not in to_text(REPORT).lower()
+    assert "Config:" not in to_markdown(REPORT)

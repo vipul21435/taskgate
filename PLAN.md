@@ -53,6 +53,20 @@ passes the same review gates before it is accepted.
   - Writing the Markdown to `$GITHUB_STEP_SUMMARY` is done by the CI workflow,
     not by TaskGate, until the GitHub slice.
 
+- **Slice 1 decisions (2026-09-30):**
+  - `Gate` is a `typing.Protocol` (read-only properties plus `check(ctx)`), so a
+    frozen dataclass, a class instance or the `@gate` decorator's `FunctionGate`
+    all qualify. Gates run in code order; `requires` must name a lower code.
+  - Third-party gates must use TG7xx-TG9xx, so a later built-in code can never
+    collide with an installed plugin. A plugin that fails to load or breaks the
+    contract is a usage error (exit 2) listing every problem; a gate that raises
+    at check time is reported as a failure and the other gates still run.
+  - `taskgate.toml` is read from the base ref in diff mode (`git show
+    <base>:taskgate.toml`), never from the pull request, so a pull request cannot
+    disable the gates that check it. `--all` reads `<root>/taskgate.toml`;
+    `--config` overrides both. Disabled gates are not reported; a gate whose
+    requirement is disabled is skipped with "(disabled)" in the message.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
