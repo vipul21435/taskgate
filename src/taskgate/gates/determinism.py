@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import shlex
 
-from taskgate.determinism import Flip, Rerun, count_tests, flips, rerun
+from taskgate.determinism import ERROR, FAILED, Flip, Rerun, count_tests, flips, rerun
 from taskgate.gates.base import Check, TaskContext, gate
-from taskgate.gates.core import run_failure
 from taskgate.results import Severity
 
 LISTED = 3
@@ -64,11 +63,14 @@ def grader_deterministic(ctx: TaskContext) -> Check:
     budget = f"{len(seeds) + 1} x task.timeout_sec = {timeout * (len(seeds) + 1)} s"
     regraded = ctx.regrade(seeds)
     solution = regraded.solution
+    again = "the reference solution, run again for the reruns,"
     if solution.timed_out:
-        return Check.fail(f"the reference solution did not finish again for the reruns ({budget})")
-    if solution.solution_exit != 0 or solution.error is not None:
-        failure = run_failure(solution, "the solution run", timeout)
-        return Check.fail(f"the reference solution failed again for the reruns: {failure}")
+        return Check.fail(f"{again} did not finish ({budget})")
+    if solution.error is not None:
+        return Check.fail(f"{again} could not run: {solution.error}")
+    if solution.solution_exit != 0:
+        exited = f"solution/solve.sh exited {solution.solution_exit}: {solution.summary}"
+        return Check.fail(f"{again} failed: {exited}")
 
     reruns = [rerun(number, run) for number, run in enumerate(regraded.runs, start=1)]
     found = flips(reruns)
@@ -81,7 +83,7 @@ def grader_deterministic(ctx: TaskContext) -> Check:
     unexplained = [
         run
         for run in failing
-        if run.problem is None and not any(o in ("failed", "error") for o in run.outcomes.values())
+        if run.problem is None and not {FAILED, ERROR} & set(run.outcomes.values())
     ]
     details += [
         f"{run.label}: pytest exited {run.exit} with no failing test; "
@@ -101,7 +103,8 @@ def grader_deterministic(ctx: TaskContext) -> Check:
     if missing and regraded.error is None:
         problems.append(f"{_plural(missing, 'rerun')} did not start")
     if regraded.error is not None:
-        problems.append(f"the runner stopped after {len(reruns)} reruns: {regraded.error}")
+        stopped = _plural(len(reruns), "rerun")
+        problems.append(f"the runner stopped after {stopped}: {regraded.error}")
     if found:
         problems.append(_flip_names(found))
     if problems:

@@ -287,3 +287,13 @@ def test_seeded_env_puts_the_plugin_first_on_pythonpath(tmp_path: Path) -> None:
         "PYTHONPATH": f"{tmp_path}:/x",
     }
     assert seeded_env({}, 0, tmp_path)["PYTHONPATH"] == str(tmp_path)
+
+
+def test_regrade_reports_a_workspace_it_cannot_save(tmp_path: Path, runner: LocalRunner) -> None:
+    solve = "#!/bin/sh\nset -eu\nmkfifo pipe\n"
+    task = make_task(tmp_path / "echo", solve=solve)
+    regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=60)
+    assert regraded.solution.solution_exit == 0
+    assert regraded.runs == ()
+    assert regraded.error is not None
+    assert regraded.error.startswith("could not save the solved workspace for the reruns: ")

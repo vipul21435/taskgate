@@ -263,7 +263,7 @@ def test_a_runner_error_between_reruns_fails_the_gate(tmp_path: Path) -> None:
     runner = canned(run_ok(1), error="could not restore the workspace before rerun 2")
     result = tg501(make_task(tmp_path / "echo"), runner=runner)
     assert result.message == (
-        "the runner stopped after 1 reruns: could not restore the workspace before rerun 2"
+        "the runner stopped after 1 rerun: could not restore the workspace before rerun 2"
     )
 
 
@@ -272,18 +272,17 @@ def test_a_runner_error_between_reruns_fails_the_gate(tmp_path: Path) -> None:
     [
         (
             RunResult(None, None, timed_out=True, output=""),
-            "the reference solution did not finish again for the reruns "
+            "the reference solution, run again for the reruns, did not finish "
             "(6 x task.timeout_sec = 360 s)",
         ),
         (
             RunResult(2, None, timed_out=False, output="flaky solve"),
-            "the reference solution failed again for the reruns: "
+            "the reference solution, run again for the reruns, failed: "
             "solution/solve.sh exited 2: flaky solve",
         ),
         (
             RunResult(None, None, timed_out=False, output="", error="container exited 137"),
-            "the reference solution failed again for the reruns: "
-            "the solution run could not run: container exited 137",
+            "the reference solution, run again for the reruns, could not run: container exited 137",
         ),
     ],
 )

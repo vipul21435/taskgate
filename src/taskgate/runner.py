@@ -387,7 +387,11 @@ class LocalRunner:
                 return Regrade(RunResult(done.code, None, timed_out, output=tail(done.stdout)))
             solved = RunResult(0, None, timed_out=False, output="")
             snapshot = root / "solved"
-            shutil.copytree(workspace, snapshot, symlinks=True)
+            try:
+                shutil.copytree(workspace, snapshot, symlinks=True)
+            except OSError as exc:
+                error = f"could not save the solved workspace for the reruns: {exc}"
+                return Regrade(solved, error=error)
             plugin = root / PLUGIN_DIR
             plugin.mkdir()
             (plugin / f"{PLUGIN_MODULE}.py").write_bytes(plugin_source())

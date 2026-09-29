@@ -247,7 +247,7 @@ passes the same review gates before it is accepted.
   `FROM` is digest-pinned (TG302), a no-op stub solution must fail the grader
   (TG403). Unit tests use a fake `docker` executable on PATH; one opt-in
   integration test uses real Docker.
-- [x] **3. Grader determinism.** Done 2026-09-30: 14 built-in gates, 388 tests
+- [x] **3. Grader determinism.** Done 2026-09-30: 14 built-in gates, 389 tests
   (plus 5 opt-in real-Docker tests, green locally and in CI), 100% branch
   coverage; `taskgate grade` reproduces a rerun. The determinism gate (TG501)
   reruns the grader N times (default 5, `[determinism] runs` in `taskgate.toml`) on the reference

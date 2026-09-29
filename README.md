@@ -466,7 +466,7 @@ flowchart LR
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 388 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2415 statements, 666 branches); gate is 90% |
+| Tests and coverage | `make cov` | 389 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2422 statements, 668 branches); gate is 90% |
 | Real-Docker tests | `time make test-docker` | 5 passed in 10.1 to 10.4 s (two runs, task images already built), including TG501 in a real container finding the same flips as the local runner; also green on the GitHub Actions runner (13.1 s) |
 | Demo wall time, local runner | `time make demo` | 5.34 to 6.28 s over three runs (four pull requests; 1.95 to 2.00 s for three before TG501) |
 | Demo wall time, Docker runner | `time make demo-docker` | 8.44 to 8.68 s over two runs with the four task images built; 10.84 s on the run that built the new log-levels image |
