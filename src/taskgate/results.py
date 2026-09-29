@@ -1,0 +1,95 @@
+"""Result model shared by gates and reports."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+
+
+class Severity(StrEnum):
+    """How much a failing gate matters. Only ``error`` blocks a pull request."""
+
+    ERROR = "error"
+    WARNING = "warning"
+    INFO = "info"
+
+
+class Status(StrEnum):
+    """Outcome of one gate on one task."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+
+
+@dataclass(frozen=True, slots=True)
+class GateResult:
+    """One gate's verdict on one task."""
+
+    code: str
+    """Stable gate code, for example ``TG401``."""
+
+    name: str
+    """Short kebab-case gate name, for example ``solution-passes``."""
+
+    severity: Severity
+    status: Status
+    message: str
+    fix_hint: str | None = None
+    """How to fix the task; set only when the gate failed."""
+
+    @property
+    def blocking(self) -> bool:
+        """True when this result alone makes the pull request fail."""
+        return self.status is Status.FAIL and self.severity is Severity.ERROR
+
+
+@dataclass(frozen=True, slots=True)
+class TaskReport:
+    """Every gate result for one task directory."""
+
+    path: str
+    """Task directory relative to the repository root, in POSIX form."""
+
+    change: str | None
+    """``added``, ``modified`` or ``removed`` in diff mode; ``None`` when checking all tasks."""
+
+    results: tuple[GateResult, ...] = ()
+    changed_files: tuple[str, ...] = ()
+
+    @property
+    def checked(self) -> bool:
+        return self.change != "removed"
+
+    @property
+    def blocking_failures(self) -> int:
+        return sum(result.blocking for result in self.results)
+
+    @property
+    def verdict(self) -> str:
+        """``pass``, ``fail`` (a blocking gate failed) or ``skip`` (removed task)."""
+        if not self.checked:
+            return "skip"
+        return "fail" if self.blocking_failures else "pass"
+
+
+@dataclass(frozen=True, slots=True)
+class CheckReport:
+    """The outcome of one ``taskgate check`` run."""
+
+    version: str
+    mode: str
+    """``diff`` (tasks changed against a base) or ``all`` (every task under the root)."""
+
+    base: str | None = None
+    merge_base: str | None = None
+    tasks: tuple[TaskReport, ...] = ()
+    other_files: tuple[str, ...] = field(default=())
+
+    @property
+    def blocking_failures(self) -> int:
+        return sum(task.blocking_failures for task in self.tasks)
+
+    @property
+    def passed(self) -> bool:
+        return self.blocking_failures == 0
