@@ -7,9 +7,10 @@ agents. TaskGate finds the task directories a pull request touches, runs each
 one through a set of gates with stable codes (layout, manifest schema and lint,
 secrets, file sizes and binaries, the environment builds from a digest-pinned
 base, the reference solution must pass, an untouched workspace and an
-empty-output stub must fail), and reports the result as terminal text, a
-Markdown pull-request summary and JSON, with a non-zero exit when a blocking
-gate fails. Solutions and graders run in the task's own Docker image with no
+empty-output stub must fail, and the grader must give the same per-test
+outcomes when rerun with a shuffled test order and new seeds), and reports the
+result as terminal text, a Markdown pull-request summary and JSON, with a
+non-zero exit when a blocking gate fails. Solutions and graders run in the task's own Docker image with no
 network and resource limits, or in a local temporary directory when Docker is
 not available.
 
@@ -25,7 +26,7 @@ answer should be) is the most common way a task goes wrong.
   path to the task directory that owns it, labels each task `added`, `modified`
   or `removed`, and runs the gates on every task that still exists. `--all`
   checks every task under a directory instead (no git needed).
-- **Thirteen gates**, run in code order; a gate whose prerequisite did not pass,
+- **Fourteen gates**, run in code order; a gate whose prerequisite did not pass,
   or whose input is missing, is reported as `skip` rather than as a second failure:
 
   | Code | Name | Default | Passes when |
@@ -43,9 +44,27 @@ answer should be) is the most common way a task goes wrong.
   | TG401 | solution-passes | error | `solve.sh` exits 0 and the pytest grader then passes (needs TG101 and a built environment) |
   | TG402 | baseline-fails | error | the grader fails on the untouched workspace and collects at least one test (needs TG101 and a built environment) |
   | TG403 | stub-solution-fails | error | the grader fails after a stub `solve.sh` that creates every file the reference solution created, empty (needs TG401) |
+  | TG501 | grader-deterministic | error | on 5 reruns of the grader (`[determinism] runs`) over the reference solution's output, each with a seeded shuffle of the test order, its own `PYTHONHASHSEED` and `TASKGATE_SEED`, every rerun passes and every test has the same outcome (needs TG401) |
 
   Only `error` failures block. The full task layout, runtime contract and gate
   rules are in [docs/task-layout.md](docs/task-layout.md).
+- **Grader determinism (TG501).** The reference solution runs once more, then
+  the grader runs 5 times on identical copies of its output (the workspace is
+  restored before each rerun). Rerun `i` uses seed `i` (`[determinism] seed`
+  moves the start) three ways: a pytest plugin TaskGate bundles
+  (`shuffle_plugin.py`, loaded as `-p taskgate_shuffle --taskgate-seed i`)
+  shuffles the collected tests with `random.Random(i)` and seeds `random`;
+  `PYTHONHASHSEED=i` changes set and hash ordering; `TASKGATE_SEED=i` is there
+  for graders that draw random cases. Each rerun writes pytest's JUnit XML, and
+  the gate compares the exit code and every test's outcome. It fails when a
+  rerun fails, when a test's outcome differs between reruns, or when a test
+  fails in every rerun although TG401's run (file order, `PYTHONHASHSEED=0`)
+  passed, and lists each flipped test with the runs and seeds of each outcome
+  and one command that repeats the first failing rerun.
+- **`taskgate grade TASK --seed S`** is that command: it runs the reference
+  solution, then the grader exactly as TG501's rerun with seed `S` did, and
+  prints pytest's output and each test's outcome in the order the tests ran
+  (exit 0 when the grader passes, 1 when it fails).
 - **A secret scanner** (`secretscan.py`) that streams every text file line by
   line and never prints more than the first four characters of a match. Its
   high-entropy rule needs mixed case and digits, at least 4.0 bits per
@@ -89,8 +108,8 @@ answer should be) is the most common way a task goes wrong.
   failure, 2 usage error (not a git repository, unknown base ref, invalid
   `taskgate.toml`).
 - **A sample repository builder** (`examples/build_sample_repo.py`) that creates
-  a git repository with a `main` branch and three pull-request branches: one
-  good task and two flawed ones. Commits use fixed authors and dates, so the
+  a git repository with a `main` branch and four pull-request branches: one
+  good task and three flawed ones. Commits use fixed authors and dates, so the
   merge base (`b26918e`) and every report are identical on macOS and in the
   Linux container, and the content-derived image tags are the same on macOS and
   on the GitHub Actions runner.
@@ -126,6 +145,10 @@ answer should be) is the most common way a task goes wrong.
   memory_mb = 1024            # --memory and --memory-swap
   pids_limit = 256
   build_timeout_sec = 900
+
+  [determinism]               # TG501
+  runs = 5                    # 2..100 grader reruns
+  seed = 1                    # rerun i uses seed + i - 1
   ```
 
   Unknown sections, keys, gate codes, bad values and invalid regexes are errors
@@ -134,6 +157,10 @@ answer should be) is the most common way a task goes wrong.
   check it; `--config PATH` overrides that. Reports name the config source, every
   override and every option that differs from its default (`config: taskgate.toml;
   options manifest.max_timeout_sec=60, files.max_file_bytes=1024`).
+- **Report details.** A gate can attach detail lines to its result: the text
+  report prints them under the gate's line, `report.md` lists them under
+  "Details" with each reproduce command as code, and `report.json` carries them
+  as a `details` list.
 - `taskgate tasks [ROOT]` lists task directories and the layout parts each lacks.
 - A digest-pinned Docker image (non-root user, git included) that runs the CLI
   and the demo (on the local runner: the image has no Docker CLI), and GitHub
@@ -151,10 +178,11 @@ uv run taskgate check --all examples/sample-repo
 ```
 
 Verified from a fresh clone. `make demo` needs no network, Docker or tokens (it
-passes `--runner local` through `TASKGATE_RUNNER`) and took 1.95 to 2.00 s over three runs
-(`time make demo`, 8 GB M-series Mac). The last command exits 1 on purpose: the
+passes `--runner local` through `TASKGATE_RUNNER`) and took 5.34 to 6.28 s over
+three runs (`time make demo`, 8 GB M-series Mac; 1.95 to 2.00 s before TG501
+added five grader reruns per task). The last command exits 1 on purpose: the
 bundled draft task is incomplete. With Docker running, `make demo-docker` runs
-the same three pull requests on the Docker runner (3.6 to 3.8 s with the task
+the same four pull requests on the Docker runner (8.4 to 8.7 s with the task
 images already built).
 
 ## Usage
@@ -162,6 +190,7 @@ images already built).
 ```
 taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json] [--config FILE]
                [--runner auto|docker|local]
+taskgate grade TASK --seed N [--runner auto|docker|local] [--config FILE]
 taskgate gates [ROOT] [--json] [--config FILE]
 taskgate tasks [ROOT] [--json] [--strict]
 taskgate version
@@ -186,6 +215,7 @@ tasks/integer-determinant  added  PASS
   pass  TG401  solution-passes        reference solution passes the grader (3 passed)
   pass  TG402  baseline-fails         an untouched workspace fails the grader (3 failed)
   pass  TG403  stub-solution-fails    a stub that writes output/determinants.txt empty fails the grader (2 failed, 1 passed)
+  pass  TG501  grader-deterministic   the grader passed all 5 reruns with identical per-test outcomes (3 tests, seeds 1-5, shuffled order)
 result: PASS, 0 blocking failures
 ```
 
@@ -212,6 +242,7 @@ tasks/word-count  added  FAIL
   FAIL  TG402  baseline-fails         the grader passes an untouched workspace (2 skipped)
         fix: Make the grader assert on the output the instruction asks for, so a workspace where nothing was done cannot pass (no skips or early returns).
   pass  TG403  stub-solution-fails    a stub that writes output/counts.txt empty fails the grader (2 failed)
+  pass  TG501  grader-deterministic   the grader passed all 5 reruns with identical per-test outcomes (2 tests, seeds 1-5, shuffled order)
 result: FAIL, 3 blocking failures
 ```
 
@@ -239,8 +270,50 @@ tasks/gcd-pairs  added  FAIL
   pass  TG402  baseline-fails         an untouched workspace fails the grader (2 failed)
   FAIL  TG403  stub-solution-fails    the grader passes a stub that writes output/gcds.txt empty (2 passed)
         fix: Make the grader check what each output contains, not only that it exists: compare exact content or line counts (zip(..., strict=True)), so empty placeholder files cannot pass.
+  pass  TG501  grader-deterministic   the grader passed all 5 reruns with identical per-test outcomes (2 tests, seeds 1-5, shuffled order)
 result: FAIL, 2 blocking failures
 ```
+
+The fourth branch adds a task whose grader parses the output in its first test
+and caches it in a module-level dict that the other two tests read. Every other
+gate passes, since pytest runs tests in file order; TG501 shuffles the order,
+and the two tests that read the cache fail whenever they run before the one
+that fills it. This run used the Docker runner too:
+
+```
+taskgate 0.1.0: diff against main (merge base b26918e), 1 changed task, docker runner
+tasks/log-levels  added  FAIL
+  ...
+  pass  TG401  solution-passes        reference solution passes the grader (3 passed)
+  pass  TG402  baseline-fails         an untouched workspace fails the grader (3 failed)
+  pass  TG403  stub-solution-fails    a stub that writes output/counts.txt empty fails the grader (2 failed, 1 passed)
+  FAIL  TG501  grader-deterministic   4 of 5 reruns failed; 2 tests flipped: tests/test_outputs.py::test_counts_match, tests/test_outputs.py::test_one_line_per_level
+        - tests/test_outputs.py::test_counts_match: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner docker
+        - tests/test_outputs.py::test_one_line_per_level: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner docker
+        fix: Make each test independent of test order, hash order and chance: no state shared between tests, sort sets and dict keys before comparing or printing, and seed any random generator from TASKGATE_SEED. Run the reproduce command from the directory the task paths are relative to.
+result: FAIL, 1 blocking failure
+```
+
+The reproduce command, run from the sample repository's root on that branch,
+shows the failing order (the two cache readers ran before the test that fills
+the cache):
+
+```
+$ taskgate grade tasks/log-levels --seed 1 --runner local
+taskgate grade tasks/log-levels: reference solution, then the grader with seed 1 (shuffled order, PYTHONHASHSEED=1, TASKGATE_SEED=1), local runner
+FF.                                                                      [100%]
+...
+E       AssertionError: assert {} == {'DEBUG': 2, ... 6, 'WARN': 2}
+...
+2 failed, 1 passed in 0.02s
+failed   tests/test_outputs.py::test_counts_match
+failed   tests/test_outputs.py::test_one_line_per_level
+passed   tests/test_outputs.py::test_output_parses
+result: FAIL (pytest exited 1)
+```
+
+With `--seed 5` the same command prints the three tests in file order and
+`result: PASS`.
 
 The `report.md` written for that branch on the local runner, ready to post as a
 pull-request comment:
@@ -248,13 +321,13 @@ pull-request comment:
 ```markdown
 ## TaskGate: FAIL
 
-2 blocking failures; diff against main (merge base b26918e), 1 changed task, local runner.
+1 blocking failure; diff against main (merge base b26918e), 1 changed task, local runner.
 
 | Task | Change | Verdict | Blocking gates |
 | --- | --- | --- | --- |
-| `tasks/gcd-pairs` | added | **fail** | TG302, TG403 |
+| `tasks/log-levels` | added | **fail** | TG501 |
 
-### `tasks/gcd-pairs`
+### `tasks/log-levels`
 
 | Gate | Status | Message |
 | --- | --- | --- |
@@ -262,36 +335,44 @@ pull-request comment:
 | TG102 manifest-valid | pass | manifest valid |
 | TG103 manifest-known-keys | pass | no unknown keys |
 | TG104 timeout-in-range | pass | task.timeout_sec 60 is within 10..1800 |
-| TG105 instruction-not-empty | pass | instruction.md has 70 words |
+| TG105 instruction-not-empty | pass | instruction.md has 96 words |
 | TG201 no-secrets | pass | no secrets in 6 text files |
-| TG202 file-size-limits | pass | 6 files, 2.6 KiB in total |
+| TG202 file-size-limits | pass | 6 files, 3.1 KiB in total |
 | TG203 no-binary-files | pass | no binary files |
 | TG301 environment-builds | pass | Dockerfile passes the static checks; not built: the local runner does not use Docker |
-| TG302 base-images-pinned | **fail** (error) | 1 image is not pinned by digest: line 3: FROM python:3.12-slim |
-| TG401 solution-passes | pass | reference solution passes the grader (2 passed) |
-| TG402 baseline-fails | pass | an untouched workspace fails the grader (2 failed) |
-| TG403 stub-solution-fails | **fail** (error) | the grader passes a stub that writes output/gcds.txt empty (2 passed) |
+| TG302 base-images-pinned | pass | 1 image pinned by sha256 digest |
+| TG401 solution-passes | pass | reference solution passes the grader (3 passed) |
+| TG402 baseline-fails | pass | an untouched workspace fails the grader (3 failed) |
+| TG403 stub-solution-fails | pass | a stub that writes output/counts.txt empty fails the grader (2 failed, 1 passed) |
+| TG501 grader-deterministic | **fail** (error) | 4 of 5 reruns failed; 2 tests flipped: tests/test_outputs.py::test_counts_match, tests/test_outputs.py::test_one_line_per_level |
+
+Details:
+
+- **TG501**: tests/test_outputs.py::test_counts_match: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: `taskgate grade tasks/log-levels --seed 1 --runner local`
+- **TG501**: tests/test_outputs.py::test_one_line_per_level: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: `taskgate grade tasks/log-levels --seed 1 --runner local`
 
 How to fix:
 
-- **TG302**: Pin each image by digest, e.g. FROM python:3.12-slim@sha256:<digest> (docker buildx imagetools inspect python:3.12-slim prints it); scratch and earlier build stages need no digest.
-- **TG403**: Make the grader check what each output contains, not only that it exists: compare exact content or line counts (zip(..., strict=True)), so empty placeholder files cannot pass.
+- **TG501**: Make each test independent of test order, hash order and chance: no state shared between tests, sort sets and dict keys before comparing or printing, and seed any random generator from TASKGATE_SEED. Run the reproduce command from the directory the task paths are relative to.
 
 <sub>taskgate 0.1.0</sub>
 ```
 
 A copy of the accepted sample task with a broken environment (no `USER`, and a
 `RUN pip install` step that exits 1), checked with
-`taskgate check --all DIR --runner docker`. The static problem and the build
-failure are reported together, and the runtime gates skip instead of failing a
-second time:
+`taskgate check --all DIR --runner docker` (the lines that did not pass). The
+static problem and the build failure are reported together, and the runtime
+gates skip instead of failing a second time:
 
 ```
 taskgate 0.1.0: all tasks, 1 task, docker runner
-  FAIL  TG301  environment-builds     the final stage has no USER instruction, so the image runs as root; docker build failed (exit 1): ERROR: failed to build: failed to solve: process "/bin/sh -c pip install --no-cache-dir pytest==9.1.2" did not complete successfully: exit code: 1
+tasks/modular-inverse  FAIL
+  FAIL  TG301  environment-builds     the final stage has no USER instruction, so the image runs as root; docker build failed (exit 1): ERROR: failed to build: failed to solve: process "/bin/sh -c pip install --no-cache-dir pytest==9.1.2 && useradd --create-home --uid 1000 agent && mkdir /workspace && chown agent /workspace" did not complete successfully: exit code: 1
+        fix: Make docker build environment/ succeed: every COPY source must exist in environment/, environment/workspace/ must be copied into the image, and the final stage needs a non-root USER.
   skip  TG401  solution-passes        skipped: the environment did not build (see TG301)
   skip  TG402  baseline-fails         skipped: the environment did not build (see TG301)
   skip  TG403  stub-solution-fails    skipped: requires TG401 to pass
+  skip  TG501  grader-deterministic   skipped: requires TG401 to pass
 result: FAIL, 1 blocking failure
 ```
 
@@ -321,7 +402,7 @@ TG1xx  layout and manifest
   TG102  error    manifest-valid         task.toml parses and has every required key with a valid value
   TG103  warning  manifest-known-keys    task.toml has no unknown tables or keys (likely typos)
   TG104  warning  timeout-in-range       task.timeout_sec is inside the recommended range (default 10..1800 s)
-  TG105  error    instruction-not-empty  instruction.md is UTF-8 and has text beyond headings and comments
+  TG105  error    instruction-not-empty  instruction.md is UTF-8 and has words beyond headings, comments and bare markup
 TG2xx  hygiene
   TG201  error    no-secrets             no credentials: known token formats, private keys or high-entropy strings
   TG202  error    file-size-limits       every file and the task as a whole stay under the size limits (1 MiB, 10 MiB)
@@ -333,12 +414,14 @@ TG4xx  solution and baselines
   TG401  error    solution-passes        the reference solution passes the grader in a fresh workspace
   TG402  error    baseline-fails         the grader fails when no solution has run (untouched workspace)
   TG403  error    stub-solution-fails    a stub that writes the reference solution's new files, empty, fails the grader
-13 gates: 13 built-in, 0 from plugins
+TG5xx  determinism
+  TG501  error    grader-deterministic   the grader gives the same verdict and per-test outcomes on N reruns with shuffled test order and new seeds
+14 gates: 14 built-in, 0 from plugins
 ```
 
 `report.json` carries the same data plus the runner, the full merge-base hash,
-each task's changed files and a `blocking` flag per gate. CI appends the demo
-reports of both runners to the job summaries.
+each task's changed files, and a `blocking` flag and a `details` list per gate.
+CI appends the demo reports of both runners to the job summaries.
 
 ## Architecture
 
@@ -350,7 +433,9 @@ flowchart LR
     GATES --> MAN["manifest.py<br/>schema, unknown keys"]
     GATES --> SEC["secretscan.py<br/>formats, keys, entropy"]
     GATES --> DF["dockerfile.py<br/>parse, static checks,<br/>pulled images"]
-    GATES --> RUN["Runner: build + run<br/>reference / none / stub"]
+    GATES --> DET["determinism.py<br/>JUnit outcomes, flips"]
+    GATES --> RUN["Runner: build + run<br/>reference / none / stub,<br/>regrade with seeds"]
+    RUN --> SHUF["shuffle_plugin.py<br/>seeded test order"]
     RUN --> DOCK["docker_runner.py<br/>content-tagged image,<br/>docker run --network none"]
     RUN --> LOC["runner.py LocalRunner<br/>temp workspace (fallback)"]
     GATES --> RES["results.py<br/>GateResult, TaskReport,<br/>CheckReport"]
@@ -363,30 +448,33 @@ flowchart LR
 | `layout.py` | task discovery on disk (`task.toml` marks a task; outermost wins; hidden and tool dirs skipped) |
 | `changes.py` | changed-task discovery from git, using the same task rules on `git ls-tree` of both refs |
 | `manifest.py` | `task.toml` parsing, schema validation that collects every problem, unknown keys with did-you-mean hints |
-| `runner.py` | the `Runner` protocol (`build`, `run` with a reference, no or stub solution), `RunResult`, the local subprocess runner |
-| `docker_runner.py` | the Docker runner (content-derived tags, locked-down `docker run`, in-container driver), `docker_status` and the auto/docker/local choice |
+| `runner.py` | the `Runner` protocol (`build`, `run` with a reference, no or stub solution, `regrade` with seeds), `RunResult`, `Regrade`, the local subprocess runner |
+| `docker_runner.py` | the Docker runner (content-derived tags, locked-down `docker run`, in-container driver with a regrade mode), `docker_status` and the auto/docker/local choice |
+| `shuffle_plugin.py` | the pytest plugin copied into every TG501 rerun: seeded test order and a seeded `random` |
+| `determinism.py` | JUnit XML to pytest test ids and outcomes, flipped tests and how to describe them |
 | `dockerfile.py` | Dockerfile parsing, the static checks behind TG301, the pulled-image list behind TG302 |
 | `files.py` | which task paths are content (caches and `.DS_Store` are not) and a sorted walk |
-| `gates/` | the `Gate` protocol, `TaskContext` and `@gate` (`base.py`); layout, manifest and runtime gates (`core.py`); manifest and instruction lint (`lint.py`); secrets, sizes and binaries (`hygiene.py`); build and digest pins (`environment.py`) |
+| `gates/` | the `Gate` protocol, `TaskContext` and `@gate` (`base.py`); layout, manifest and runtime gates (`core.py`); manifest and instruction lint (`lint.py`); secrets, sizes and binaries (`hygiene.py`); build and digest pins (`environment.py`); grader determinism (`determinism.py`) |
 | `secretscan.py` | the credential detectors behind TG201, with redacted findings |
-| `config.py` | `taskgate.toml` parsing and validation (every problem at once): gates, `[manifest]`, `[secrets]`, `[files]`, `[runner]` |
+| `config.py` | `taskgate.toml` parsing and validation (every problem at once): gates, `[manifest]`, `[secrets]`, `[files]`, `[runner]`, `[determinism]` |
 | `registry.py` | built-in plus entry-point gates, validated and sorted by code |
 | `engine.py` | `run_gates`: runs gates in code order, skips unmet `requires`, contains gate crashes |
 | `report.py` | pure renderers from a `CheckReport` to text, Markdown and JSON |
-| `cli.py` | Typer commands `check` (with `--runner`), `gates`, `tasks`, `version` |
+| `cli.py` | Typer commands `check` (with `--runner`), `grade`, `gates`, `tasks`, `version` |
 
 ## Measured
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 292 passed, 4 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (1935 statements, 524 branches); gate is 90% |
-| Real-Docker tests | `time make test-docker` | 4 passed in 7.2 to 8.1 s (two runs, task image already built); also green on the GitHub Actions runner |
-| Demo wall time, local runner | `time make demo` | 1.95 to 2.00 s over three runs |
-| Demo wall time, Docker runner | `time make demo-docker` | 3.62 to 3.79 s over three runs with the three task images built; 5.43 s after `make clean-images` (BuildKit layer cache still warm) |
-| Demo in the TaskGate image | `time docker run --rm --entrypoint sh taskgate:local examples/demo.sh /tmp/taskgate-demo` | 2.03 to 2.21 s over three runs |
-| Image sizes | `docker image ls taskgate`, `docker image ls taskgate-env` | TaskGate image 472 MB (python:3.12-slim plus git); each sample task image 235 MB |
-| Reports, macOS vs image | `cmp` of each demo `report.md` and `report.json` (three pull requests) | all six byte-identical |
-| Image tags, macOS vs CI | TG301 messages of `make demo-docker` locally and in the CI log | the same three tags (`taskgate-env:8c498462f77c4f11`, `...13e3d22e858b2e52`, `...d98b9b87a032cdee`) |
+| Tests and coverage | `make cov` | 388 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2415 statements, 666 branches); gate is 90% |
+| Real-Docker tests | `time make test-docker` | 5 passed in 10.1 to 10.4 s (two runs, task images already built), including TG501 in a real container finding the same flips as the local runner; also green on the GitHub Actions runner (13.1 s) |
+| Demo wall time, local runner | `time make demo` | 5.34 to 6.28 s over three runs (four pull requests; 1.95 to 2.00 s for three before TG501) |
+| Demo wall time, Docker runner | `time make demo-docker` | 8.44 to 8.68 s over two runs with the four task images built; 10.84 s on the run that built the new log-levels image |
+| Demo in the TaskGate image | `time docker run --rm --entrypoint sh taskgate:local examples/demo.sh /tmp/taskgate-demo` | 6.56 to 6.91 s over three runs |
+| TG501 cost | `time taskgate check --all examples/sample-repo --runner local`, with and without `[gates] disable = ["TG501"]` | 1.08 to 1.21 s with it, 0.50 to 0.56 s without (three runs each; one complete task, five grader reruns) |
+| Image sizes | `docker image ls taskgate`, `docker image ls taskgate-env` | TaskGate image 473 MB (python:3.12-slim plus git); each sample task image 235 MB |
+| Reports, macOS vs image | `cmp` of each demo `report.md` and `report.json` (four pull requests) | all eight byte-identical, TG501's shuffled reruns included |
+| Image tags, macOS vs CI | TG301 messages of `make demo-docker` locally and in the CI log | the same four tags (`taskgate-env:8c498462f77c4f11`, `...13e3d22e858b2e52`, `...d98b9b87a032cdee`, `...4c55c370265970c9`), and the same TG501 flips |
 | Secret-scan false positives | `uv run python examples/secret_survey.py scan .venv/lib/python3.12/site-packages` | 0 findings in 2523 text files, 689,539 lines of the locked dependencies (macOS arm64), 4.3 s |
 | Secret-scan recall | `uv run python examples/secret_survey.py recall` | 2000 seeded random base64 tokens per length: 24 chars 0.8905, 32 chars 0.9665, 40 chars 0.9720, 64 chars 0.9975 |
 | Secret scan on the samples | `uv run python examples/secret_survey.py scan examples` | 1 finding: the key planted in the bad demo pull request |
@@ -446,6 +534,23 @@ flowchart LR
   are all covered without a daemon. Four opt-in tests (`make test-docker`)
   check the same paths against real Docker, including that a container sees no
   network, a non-root uid, `memory.max` and `pids.max`.
+- **Determinism is checked against identical inputs.** TG501 grades one
+  solution output five times rather than rerunning the solution, so a flip is
+  the grader's alone, and every rerun starts from a fresh copy of that output
+  (the Docker driver keeps a tar of the workdir in its tmpfs), so a grader that
+  writes into the workspace cannot change a later rerun. A rerun is fully
+  determined by its seed: the plugin shuffles with `random.Random(seed)` and
+  seeds `random` before collection, which is why `taskgate grade --seed S`
+  reproduces it, and why the demo's flips are the same on macOS, in the image
+  and on the CI runner.
+- **"Flipped" includes "always fails".** TG401 already ran the grader once in
+  file order with `PYTHONHASHSEED=0` and it passed, so a test that fails in all
+  five reruns (a grader that iterates a set the solution also iterated, say)
+  has flipped against that run and is reported the same way.
+- **Test ids from JUnit XML.** Outcomes come from pytest's own JUnit report
+  (`xunit1`, which keeps the file), not from parsing console output, and the
+  ids are rebuilt as `tests/test_x.py::Class::test_y[param]`, the form pytest
+  accepts on its command line.
 - **Hermetic local runs.** The runner works on copies in a temporary directory,
   writes an empty `pytest.ini` there so the surrounding repository's pytest
   config cannot leak in, drops `PYTEST_*` and coverage variables, sets
@@ -482,6 +587,28 @@ flowchart LR
   already touch.
 - Gates run sequentially and nothing is cached yet; every run re-executes every
   changed task.
+- TG501 roughly doubles the time of the runtime gates on a small task (1.1 s
+  against 0.5 s on the sample repository) because it adds a solution run and
+  five grader runs; on a slow grader the cost grows with it. The solution run
+  and the reruns share `(runs + 1) x timeout_sec`.
+- TG501 catches order, hash-seed and seeded-randomness dependence that shows up
+  within its reruns. A flake that five runs do not hit (a race, a timing
+  threshold, a one-in-a-hundred order) passes; more runs (`[determinism] runs`,
+  up to 100) lower that chance but never remove it. The plugin seeds Python's
+  `random` only, not NumPy or other generators.
+- The shuffle permutes individual tests, so module- and class-scoped fixtures
+  are set up more often than in file order; a grader that is only correct under
+  its file's fixture order is reported as flaky, which is the point, but the
+  first failure can be a setup error rather than an assertion.
+- JUnit XML over 8 MiB is not read; such a rerun is reported as leaving no
+  readable JUnit XML.
+- On the Docker runner the workdir is restored between reruns by deleting its
+  contents and unpacking the saved tar as the run user, so the image must
+  provide `find -mindepth -delete`, and files the image made read-only to that
+  user cannot be restored (the gate then fails with "could not restore the
+  workspace").
+- `taskgate grade` takes the task path as reports print it, relative to the
+  repository root in diff mode, so it must be run from that directory.
 - The high-entropy detector trades recall for precision: it misses about 11% of
   random 24-character tokens and 3% of 32- to 40-character ones (see Measured),
   never flags a token without both letter cases and a digit, and does not look
@@ -494,13 +621,12 @@ flowchart LR
 ## Roadmap
 
 Planned in [PLAN.md](PLAN.md). Slices 1 (the gate registry, plugins,
-`taskgate.toml` and the static gates) and 2 (the Docker runner, TG301, TG302 and
-TG403) are built (see above); the rest is not built yet:
+`taskgate.toml` and the static gates), 2 (the Docker runner, TG301, TG302 and
+TG403) and 3 (grader determinism, TG501, and `taskgate grade`) are built (see
+above); the rest is not built yet:
 
-1. Grader determinism over N reruns with shuffled test order and varied seeds
-   (TG501), with the flaky tests and the seeds that flip them in the report.
-2. A content-hash result cache so unchanged tasks are skipped on re-runs.
-3. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
+1. A content-hash result cache so unchanged tasks are skipped on re-runs.
+2. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
    XML, a fake GitHub API for tests and the demo, and a composite `action.yml`.
 
 ## Development
@@ -511,7 +637,7 @@ TG403) are built (see above); the rest is not built yet:
 | `make lint` | `ruff check` and `ruff format --check` |
 | `make typecheck` | `mypy --strict` on `src/` |
 | `make test` / `make cov` | pytest, and pytest with the 90% branch-coverage gate |
-| `make demo` | the offline end-to-end demo described above (local runner) |
+| `make demo` | the offline end-to-end demo described above (local runner, four pull requests) |
 | `make demo-docker` | the same demo on the Docker runner, then prune this project's dangling images |
 | `make test-docker` | the opt-in tests against a real Docker daemon (`TASKGATE_DOCKER_TESTS=1 uv run pytest -m docker`) |
 | `make clean-images` | remove the `taskgate-env:*` task images the Docker runner built |

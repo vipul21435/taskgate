@@ -164,7 +164,7 @@ def timeout_in_range(ctx: TaskContext) -> Check:
     "TG105",
     "instruction-not-empty",
     severity=Severity.ERROR,
-    summary="instruction.md is UTF-8 and has text beyond headings and comments",
+    summary="instruction.md is UTF-8 and has words beyond headings, comments and bare markup",
     fix_hint=(
         "Write the task statement in instruction.md: what the agent must produce, "
         "where it goes and in what format."

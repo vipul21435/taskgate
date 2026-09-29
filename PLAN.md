@@ -160,6 +160,42 @@ passes the same review gates before it is accepted.
     so repeated unclosed `<!--` is linear. Sample word counts dropped (90 to 88,
     109 to 100) because bullets and list numbers no longer count.
 
+- **Slice 3 decisions (2026-09-30):**
+  - TG501 grades one solution output repeatedly (the spec says "on the
+    reference solution's output"): `Runner.regrade` runs `solve.sh` once more,
+    snapshots the workspace and restores it before every rerun after the first,
+    so reruns differ only by their seed and a grader that writes into the
+    workspace cannot leak state into the next one. On Docker the reruns share one
+    container; the driver keeps a tar of the workdir in the tmpfs and restores it
+    with `find -mindepth 1 -delete` plus `tar -x` (one container keeps the cost
+    to a single start; the snapshot needs the tmpfs's 256 MB).
+  - One seed per rerun drives all three knobs: `s = seed + i - 1` is the
+    shuffle seed, `PYTHONHASHSEED` and `TASKGATE_SEED`, with `[determinism]
+    seed` (default 1) and `runs` (default 5, 2..100) in `taskgate.toml`. Seeds
+    start at 1 because TG401 already ran with `PYTHONHASHSEED=0` in file order.
+  - The shuffle plugin (`src/taskgate/shuffle_plugin.py`) is copied into each
+    rerun as `taskgate_shuffle.py` and loaded by `-p` through `PYTHONPATH`, on
+    both runners, since in a task image TaskGate is not installed. It only uses
+    long-stable hooks, shuffles `trylast`, and also seeds `random` in
+    `pytest_configure` so a rerun is reproducible from its seed (a grader that
+    draws unseeded random numbers still varies between seeds).
+  - Outcomes come from JUnit XML with `-o junit_family=xunit1`, whose `file`
+    attribute lets the report rebuild pytest's node ids. A test "flips" when its
+    outcome set across the usable reruns has more than one member, or is all
+    failed/error (it passed TG401). Missing tests count as `not run`. Timed-out
+    reruns and reruns without readable XML are reported as rerun problems, not
+    as flips of every test.
+  - Gate results gained `details` (one line each), rendered in text, Markdown
+    (a "Details" list, reproduce commands as code) and JSON, instead of packing
+    every flipped test into the one-line message.
+  - The reproduce command is a new CLI command, `taskgate grade TASK --seed S`,
+    rather than a raw pytest line, because the author needs the solution's
+    output first; it uses the task path as reports show it and the runner the
+    report used. `TaskContext.label` carries that path to the gate.
+  - A fourth demo pull request (`log-levels`) has a grader whose tests share a
+    module-level cache; only TG501 blocks it, and its flips are identical on
+    macOS, in the image and on the CI runner.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
@@ -211,8 +247,10 @@ passes the same review gates before it is accepted.
   `FROM` is digest-pinned (TG302), a no-op stub solution must fail the grader
   (TG403). Unit tests use a fake `docker` executable on PATH; one opt-in
   integration test uses real Docker.
-- [ ] **3. Grader determinism.** The determinism gate (TG501) reruns the grader
-  N times (default 5, `[determinism] runs` in `taskgate.toml`) on the reference
+- [x] **3. Grader determinism.** Done 2026-09-30: 14 built-in gates, 388 tests
+  (plus 5 opt-in real-Docker tests, green locally and in CI), 100% branch
+  coverage; `taskgate grade` reproduces a rerun. The determinism gate (TG501)
+  reruns the grader N times (default 5, `[determinism] runs` in `taskgate.toml`) on the reference
   solution's output, each run with a seeded shuffle of test order (a small pytest
   plugin bundled with TaskGate), a different `PYTHONHASHSEED` and a different
   `TASKGATE_SEED`, and compares the verdict and every per-test outcome (read from
