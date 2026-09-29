@@ -31,6 +31,19 @@ def test_greeting() -> None:
     assert Path("output/greeting.txt").read_text(encoding="utf-8") == "world\\n"
 """
 
+BASE_IMAGE = (
+    "python:3.12-slim@sha256:f77ac9e44ae96ef2c90b8053ea08c31f8be030f824196b0ae4db6d462c84e51f"
+)
+DOCKERFILE = f"""\
+FROM {BASE_IMAGE}
+RUN pip install --no-cache-dir pytest==9.1.1 \\
+ && useradd --create-home --uid 1000 agent \\
+ && mkdir /workspace && chown agent /workspace
+WORKDIR /workspace
+{{copy}}USER agent
+"""
+COPY_WORKSPACE = "COPY --chown=agent workspace/ /workspace/\n"
+
 LENIENT_GRADER = """\
 from pathlib import Path
 
@@ -53,6 +66,7 @@ def make_task(
     solve: str | None = SOLVE,
     grader: str | None = GRADER,
     workspace: bool = True,
+    dockerfile: str | None = None,
 ) -> Path:
     """Write a complete task that echoes ``input/name.txt``; pass ``None`` to omit a part."""
     task_dir.mkdir(parents=True, exist_ok=True)
@@ -64,7 +78,9 @@ def make_task(
     )
     env = task_dir / "environment"
     env.mkdir(exist_ok=True)
-    (env / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    if dockerfile is None:
+        dockerfile = DOCKERFILE.format(copy=COPY_WORKSPACE if workspace else "")
+    (env / "Dockerfile").write_text(dockerfile, encoding="utf-8")
     if workspace:
         (env / "workspace" / "input").mkdir(parents=True, exist_ok=True)
         (env / "workspace" / "input" / "name.txt").write_text("world\n", encoding="utf-8")

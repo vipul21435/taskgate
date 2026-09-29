@@ -23,6 +23,12 @@
     max_task_bytes = 10485760
     binary_allow = ["environment/workspace/*.png"]
 
+    [runner]                     # the Docker runner (TG301, TG401-TG403)
+    cpus = 1.0                   # docker run --cpus
+    memory_mb = 1024             # docker run --memory (swap is not allowed on top)
+    pids_limit = 256             # docker run --pids-limit
+    build_timeout_sec = 900      # docker build wall-clock limit
+
 Globs use :func:`fnmatch.fnmatchcase` on task-relative POSIX paths, so ``*``
 also matches ``/``. Validation collects every problem before failing, and
 unknown sections, keys and gate codes are errors rather than silently ignored.
@@ -84,8 +90,18 @@ class FileOptions:
     """Task-relative path globs of binary files that TG203 accepts."""
 
 
-OptionSection = ManifestOptions | SecretOptions | FileOptions
-"""The dataclasses behind the option sections (``[manifest]``, ``[secrets]``, ``[files]``)."""
+@dataclass(frozen=True, slots=True)
+class RunnerOptions:
+    """Limits for the Docker runner; the run time limit is the task's ``timeout_sec``."""
+
+    cpus: float = 1.0
+    memory_mb: int = 1024
+    pids_limit: int = 256
+    build_timeout_sec: int = 900
+
+
+OptionSection = ManifestOptions | SecretOptions | FileOptions | RunnerOptions
+"""The dataclasses behind the option sections (``[manifest]``, ``[secrets]``, ...)."""
 
 
 def _overrides(name: str, options: OptionSection) -> list[tuple[str, OptionValue]]:
@@ -110,6 +126,7 @@ class Config:
     manifest: ManifestOptions = ManifestOptions()
     secrets: SecretOptions = SecretOptions()
     files: FileOptions = FileOptions()
+    runner: RunnerOptions = RunnerOptions()
 
     def severity_for(self, code: str, default: Severity) -> Severity:
         return self.severity.get(code, default)
@@ -132,6 +149,7 @@ class Config:
                 *_overrides("manifest", self.manifest),
                 *_overrides("secrets", self.secrets),
                 *_overrides("files", self.files),
+                *_overrides("runner", self.runner),
             ),
         )
 
@@ -256,10 +274,22 @@ def _files(raw: Mapping[str, Any], problems: _Problems) -> FileOptions:
     )
 
 
+def _runner(raw: Mapping[str, Any], problems: _Problems) -> RunnerOptions:
+    keys = ("cpus", "memory_mb", "pids_limit", "build_timeout_sec")
+    section = problems.section(raw, "runner", keys)
+    default = RunnerOptions()
+    return RunnerOptions(
+        cpus=section.number("cpus", default.cpus, 0.1, 64.0),
+        memory_mb=section.integer("memory_mb", default.memory_mb, 64, 65536),
+        pids_limit=section.integer("pids_limit", default.pids_limit, 16, 65536),
+        build_timeout_sec=section.integer("build_timeout_sec", default.build_timeout_sec, 10, 7200),
+    )
+
+
 def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     """Validate a parsed ``taskgate.toml``; raise :class:`ConfigError` listing every problem."""
     problems = _Problems()
-    problems.unknown(raw, ("gates", "manifest", "secrets", "files"), "")
+    problems.unknown(raw, ("gates", "manifest", "secrets", "files", "runner"), "")
     gates = problems.table(raw, "gates", "[gates]")
     problems.unknown(gates, ("disable", "severity"), "gates.")
     disabled = _codes(gates.get("disable", []), "gates.disable", problems)
@@ -267,6 +297,7 @@ def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     manifest = _manifest(raw, problems)
     secrets = _secrets(raw, problems)
     files = _files(raw, problems)
+    runner = _runner(raw, problems)
     if problems:
         raise ConfigError(f"invalid {source}:\n  " + "\n  ".join(problems))
     return Config(
@@ -276,6 +307,7 @@ def from_dict(raw: Mapping[str, Any], source: str) -> Config:
         manifest=manifest,
         secrets=secrets,
         files=files,
+        runner=runner,
     )
 
 

@@ -26,6 +26,11 @@ def token(length: int = 32, seed: int = 1) -> str:
     raise AssertionError("no flagged token")
 
 
+def small_task(path: Path) -> Path:
+    """The factory task with a one-line Dockerfile, so the size numbers below stay small."""
+    return make_task(path, dockerfile="FROM scratch\n")
+
+
 def hygiene(task: Path, config: Config | None = None) -> dict[str, GateResult]:
     return {r.code: r for r in run_gates(task, gates=HYGIENE_GATES, config=config)}
 
@@ -40,7 +45,7 @@ def write(task: Path, relative: str, content: str | bytes) -> None:
 
 
 def test_a_clean_task_passes_every_hygiene_gate(tmp_path: Path) -> None:
-    results = hygiene(make_task(tmp_path / "echo"))
+    results = hygiene(small_task(tmp_path / "echo"))
     assert {code: (r.status, r.message) for code, r in results.items()} == {
         "TG201": (Status.PASS, "no secrets in 6 text files"),
         "TG202": (Status.PASS, "6 files, 417 B in total"),
@@ -57,7 +62,7 @@ def test_default_severities() -> None:
 
 
 def test_secrets_in_any_file_block_and_are_redacted(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     secret = token()
     write(task, "solution/solve.sh", f"#!/bin/sh\nexport API_TOKEN={secret}\ncp a b\n")
     write(task, ".env", "KEY=" + "AKIA" + "Q" * 16 + "\n")
@@ -74,7 +79,7 @@ def test_secrets_in_any_file_block_and_are_redacted(tmp_path: Path) -> None:
 
 
 def test_secret_scan_exclude_and_allow_lists(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     write(task, "tests/data/fixture.txt", token(seed=2) + "\n")
     write(task, "instruction.md", f"Use the sample key {token(seed=3)}.\n")
     assert hygiene(task)["TG201"].message.startswith("2 likely secrets")
@@ -84,7 +89,7 @@ def test_secret_scan_exclude_and_allow_lists(tmp_path: Path) -> None:
 
 
 def test_secret_scan_skips_binary_files_and_tolerates_bad_utf8(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     write(task, "environment/workspace/input/blob.bin", b"\0" + token().encode())
     write(task, "environment/workspace/input/latin1.txt", b"caf\xe9 " + token(seed=4).encode())
     result = hygiene(task)["TG201"]
@@ -92,7 +97,7 @@ def test_secret_scan_skips_binary_files_and_tolerates_bad_utf8(tmp_path: Path) -
 
 
 def test_secret_findings_are_capped_in_the_message(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     write(task, "notes.txt", "".join(f"{token(seed=n)}\n" for n in range(7)))
     message = hygiene(task)["TG201"].message
     assert message.startswith("7 likely secrets: notes.txt:1 ")
@@ -100,7 +105,7 @@ def test_secret_findings_are_capped_in_the_message(tmp_path: Path) -> None:
 
 
 def test_file_size_limits(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     write(task, "environment/workspace/input/big.txt", "x" * 3000)
     write(task, "environment/workspace/input/bigger.txt", "x" * 5000)
     options = FileOptions(max_file_bytes=2048, max_task_bytes=6000)
@@ -115,13 +120,13 @@ def test_file_size_limits(tmp_path: Path) -> None:
 
 
 def test_total_size_alone_can_fail(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     result = hygiene(task, Config(files=FileOptions(max_task_bytes=100)))["TG202"]
     assert result.message == "the task holds 417 B, over the 100 B task limit"
 
 
 def test_many_big_files_are_capped_in_the_message(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     for n in range(7):
         write(task, f"data/part{n}.txt", "y" * 200)
     result = hygiene(task, Config(files=FileOptions(max_file_bytes=150)))["TG202"]
@@ -146,7 +151,7 @@ def test_human_size(size: int, text: str) -> None:
 
 
 def test_binary_files_need_to_be_allowed(tmp_path: Path) -> None:
-    task = make_task(tmp_path / "echo")
+    task = small_task(tmp_path / "echo")
     write(task, "environment/workspace/input/chart.png", PNG_HEADER)
     write(task, "tests/expected.bin", b"\0\1\2")
     result = hygiene(task)["TG203"]

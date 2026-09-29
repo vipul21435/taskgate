@@ -56,7 +56,12 @@ def manifest_valid(ctx: TaskContext) -> Check:
     return Check.ok("manifest valid")
 
 
+NOT_BUILT = "skipped: the environment did not build (see TG301)"
+
+
 def _run_failure(run: RunResult, what: str, timeout_sec: int) -> str:
+    if run.error is not None:
+        return f"{what} could not run: {run.error}"
     if run.timed_out:
         return f"{what} exceeded the {timeout_sec}s budget (task.timeout_sec)"
     if run.solution_exit not in (None, 0):
@@ -78,7 +83,9 @@ def _run_failure(run: RunResult, what: str, timeout_sec: int) -> str:
     requires=("TG101",),
 )
 def solution_passes(ctx: TaskContext) -> Check:
-    run = ctx.run(with_solution=True)
+    if not ctx.build().ok:
+        return Check.skip(NOT_BUILT)
+    run = ctx.run("reference")
     if run.grader_passed:
         return Check.ok(f"reference solution passes the grader ({run.summary})")
     return Check.fail(_run_failure(run, "the solution run", ctx.manifest.timeout_sec))
@@ -96,8 +103,10 @@ def solution_passes(ctx: TaskContext) -> Check:
     requires=("TG101",),
 )
 def baseline_fails(ctx: TaskContext) -> Check:
-    run = ctx.run(with_solution=False)
-    if run.timed_out or run.grader_exit == PYTEST_NO_TESTS:
+    if not ctx.build().ok:
+        return Check.skip(NOT_BUILT)
+    run = ctx.run("none")
+    if run.error is not None or run.timed_out or run.grader_exit == PYTEST_NO_TESTS:
         return Check.fail(_run_failure(run, "the baseline run", ctx.manifest.timeout_sec))
     if run.grader_passed:
         return Check.fail(f"the grader passes an untouched workspace ({run.summary})")

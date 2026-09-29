@@ -105,6 +105,8 @@ class CheckReport:
     tasks: tuple[TaskReport, ...] = ()
     other_files: tuple[str, ...] = field(default=())
     config: ConfigSummary = field(default_factory=ConfigSummary)
+    runner: str = "local"
+    """Where solutions and graders ran: ``local`` or ``docker``."""
 
     @property
     def blocking_failures(self) -> int:

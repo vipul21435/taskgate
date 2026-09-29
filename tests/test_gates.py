@@ -14,20 +14,28 @@ from taskgate.gates import (
     missing_layout,
 )
 from taskgate.results import GateResult, Severity, Status
-from taskgate.runner import RunResult
+from taskgate.runner import BuildResult, RunResult, Solution
 
 
 @dataclass
 class FakeRunner:
     """Returns canned results and records every call."""
 
-    with_solution: RunResult
+    reference: RunResult
     baseline: RunResult
-    calls: list[tuple[Path, bool, float]] = field(default_factory=list)
+    built: BuildResult = field(default_factory=lambda: BuildResult(ok=True, message="fake"))
+    calls: list[tuple[Path, Solution, float]] = field(default_factory=list)
 
-    def run(self, task_dir: Path, *, with_solution: bool, timeout_sec: float) -> RunResult:
-        self.calls.append((task_dir, with_solution, timeout_sec))
-        return self.with_solution if with_solution else self.baseline
+    @property
+    def name(self) -> str:
+        return "fake"
+
+    def build(self, task_dir: Path) -> BuildResult:
+        return self.built
+
+    def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
+        self.calls.append((task_dir, solution, timeout_sec))
+        return self.reference if solution == "reference" else self.baseline
 
 
 PASSED = RunResult(0, 0, timed_out=False, output="3 passed in 0.01s")
@@ -91,7 +99,7 @@ def test_grader_files_named_with_a_test_suffix_count(tmp_path: Path) -> None:
 
 def test_manifest_problems_are_joined_and_do_not_block_runtime_gates(tmp_path: Path) -> None:
     task = make_task(tmp_path / "echo", task_id="other-name")
-    runner = FakeRunner(with_solution=PASSED, baseline=FAILED)
+    runner = FakeRunner(reference=PASSED, baseline=FAILED)
     results = by_code(run_gates(task, runner=runner))
     assert results["TG102"].status is Status.FAIL
     assert "does not match the directory name 'echo'" in results["TG102"].message
@@ -101,9 +109,30 @@ def test_manifest_problems_are_joined_and_do_not_block_runtime_gates(tmp_path: P
 
 def test_runner_gets_the_manifest_timeout(tmp_path: Path) -> None:
     task = make_task(tmp_path / "echo", timeout=42)
-    runner = FakeRunner(with_solution=PASSED, baseline=FAILED)
+    runner = FakeRunner(reference=PASSED, baseline=FAILED)
     run_gates(task, runner=runner)
-    assert runner.calls == [(task, True, 42), (task, False, 42)]
+    assert runner.calls == [(task, "reference", 42), (task, "none", 42)]
+
+
+def test_runs_are_skipped_when_the_environment_does_not_build(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    runner = FakeRunner(
+        reference=PASSED, baseline=FAILED, built=BuildResult(ok=False, message="no")
+    )
+    results = by_code(run_gates(task, runner=runner))
+    for code in ("TG401", "TG402"):
+        assert results[code].status is Status.SKIP
+        assert results[code].message == "skipped: the environment did not build (see TG301)"
+    assert runner.calls == []
+
+
+def test_runner_errors_are_reported_by_both_runtime_gates(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    broken = RunResult(None, None, timed_out=False, output="", error="container exited 125")
+    results = by_code(run_gates(task, runner=FakeRunner(reference=broken, baseline=broken)))
+    assert results["TG401"].message == "the solution run could not run: container exited 125"
+    assert results["TG402"].message == "the baseline run could not run: container exited 125"
+    assert results["TG402"].status is Status.FAIL
 
 
 def test_solution_failures_are_described(tmp_path: Path) -> None:
@@ -121,7 +150,7 @@ def test_solution_failures_are_described(tmp_path: Path) -> None:
         ),
     }
     for run, message in cases.items():
-        results = by_code(run_gates(task, runner=FakeRunner(with_solution=run, baseline=FAILED)))
+        results = by_code(run_gates(task, runner=FakeRunner(reference=run, baseline=FAILED)))
         assert results["TG401"].status is Status.FAIL
         assert results["TG401"].message == message
 
@@ -137,7 +166,7 @@ def test_baseline_failures_are_described(tmp_path: Path) -> None:
         ),
     }
     for run, message in cases.items():
-        results = by_code(run_gates(task, runner=FakeRunner(with_solution=PASSED, baseline=run)))
+        results = by_code(run_gates(task, runner=FakeRunner(reference=PASSED, baseline=run)))
         assert results["TG402"].status is Status.FAIL
         assert results["TG402"].message == message
 
@@ -225,3 +254,13 @@ def test_binary_detection_follows_the_git_rule() -> None:
     assert is_binary(b"abc\0def")
     assert not is_binary(b"plain text\n")
     assert not is_binary(b"x" * 8000 + b"\0")
+
+
+def test_context_builds_once_and_runs_each_solution_once(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    runner = FakeRunner(reference=PASSED, baseline=FAILED)
+    ctx = TaskContext(task, runner=runner)
+    assert ctx.build() is ctx.build()
+    assert ctx.run() is ctx.run("reference")
+    assert ctx.run("none") is FAILED
+    assert runner.calls == [(task, "reference", 60), (task, "none", 60)]

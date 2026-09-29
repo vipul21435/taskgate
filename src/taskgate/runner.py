@@ -1,31 +1,73 @@
-"""Run a task's reference solution and grader.
+"""Build a task's environment and run a solution and the grader in it.
+
+A :class:`Runner` does two things: ``build`` the task's environment and ``run``
+one :data:`Solution` followed by the grader. There are three kinds of solution:
+
+- ``"reference"``: the task's own ``solution/`` directory (gate TG401);
+- ``"none"``: nothing runs before the grader, the workspace is untouched (TG402);
+- a :class:`Stub`: a generated ``solve.sh`` that creates the files the reference
+  solution created, empty, and does nothing else (TG403).
 
 :class:`LocalRunner` follows the runtime contract in ``docs/task-layout.md``
 without Docker: it copies ``environment/workspace/`` into a fresh temporary
-workspace, runs ``solution/solve.sh`` there with ``sh`` (unless asked for an
-untouched baseline), then runs ``python -m pytest`` on a copy of ``tests/``
-from the same working directory. The copies keep the task's source tree clean
-and keep pytest from picking up configuration from the surrounding repository.
+workspace, runs ``solve.sh`` there with ``sh``, then runs ``python -m pytest`` on
+a copy of ``tests/`` from the same working directory. The copies keep the
+task's source tree clean and keep pytest from picking up configuration from the
+surrounding repository. The Docker runner lives in :mod:`taskgate.docker_runner`.
 """
 
 from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Protocol
+from pathlib import Path, PurePosixPath
+from typing import Literal, Protocol
+
+from taskgate.files import regular_files
 
 OUTPUT_TAIL_LINES = 20
 PYTEST_NO_TESTS = 5
+PYTEST_ARGS: tuple[str, ...] = ("-m", "pytest", "-q", "-p", "no:cacheprovider")
+"""Grader arguments after the interpreter; ``--rootdir``, ``-c`` and the tests dir follow."""
+SOLUTION_ENTRY = "solve.sh"
 _IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
 _DURATION = re.compile(r"\s+in\s+\d+(?:\.\d+)?s\b.*$")
+
+
+@dataclass(frozen=True, slots=True)
+class Stub:
+    """A stand-in solution: creates ``files`` (workspace-relative) empty, nothing else.
+
+    With no files it is a pure no-op that exits 0.
+    """
+
+    files: tuple[str, ...] = ()
+
+    def script(self) -> str:
+        """The ``solve.sh`` text of this stub."""
+        lines = [
+            "#!/bin/sh",
+            "# TaskGate stub solution: the reference solution's new files, left empty.",
+            "set -eu",
+        ]
+        parents = sorted({str(PurePosixPath(path).parent) for path in self.files} - {"."})
+        if parents:
+            lines.append("mkdir -p -- " + " ".join(shlex.quote(p) for p in parents))
+        lines += [f": > {shlex.quote(path)}" for path in self.files]
+        return "\n".join(lines) + "\n"
+
+
+Solution = Literal["reference", "none"] | Stub
+"""What runs before the grader: the task's solution, nothing, or a stub."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +84,12 @@ class RunResult:
     output: str
     """The last lines of combined stdout and stderr of the step that ran last."""
 
+    created: tuple[str, ...] = ()
+    """Workspace files that did not exist before ``solve.sh`` ran and did after it."""
+
+    error: str | None = None
+    """Set when the runner itself failed (container would not start, refused root, ...)."""
+
     @property
     def grader_passed(self) -> bool:
         return self.grader_exit == 0
@@ -56,13 +104,36 @@ class RunResult:
         return "no output"
 
 
+@dataclass(frozen=True, slots=True)
+class BuildResult:
+    """Whether a task's environment is ready to run in, and a one-line account."""
+
+    ok: bool
+    message: str
+    image: str | None = None
+    """The image tag when the runner built (or reused) one."""
+
+    user: str = ""
+    """The image's configured ``USER`` (empty when unset or not built)."""
+
+    output: str = ""
+    """The last lines of the build log (on failure)."""
+
+
 class Runner(Protocol):
-    """Anything that can run a task with or without its reference solution."""
+    """Anything that can prepare a task's environment and run a solution plus the grader."""
 
-    def run(self, task_dir: Path, *, with_solution: bool, timeout_sec: float) -> RunResult: ...
+    @property
+    def name(self) -> str:
+        """Short name shown in reports: ``local`` or ``docker``."""
+        ...
+
+    def build(self, task_dir: Path) -> BuildResult: ...
+
+    def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult: ...
 
 
-def _tail(text: str) -> str:
+def tail(text: str) -> str:
     return "\n".join(text.splitlines()[-OUTPUT_TAIL_LINES:])
 
 
@@ -80,26 +151,72 @@ def _child_env() -> dict[str, str]:
     return env
 
 
-def _run(cmd: list[str], cwd: Path, env: dict[str, str], timeout: float) -> tuple[int | None, str]:
-    """Run ``cmd`` in its own process group; on timeout kill the whole group."""
+@dataclass(frozen=True, slots=True)
+class Completed:
+    """A finished (or killed) subprocess; ``code`` is ``None`` when it hit its deadline."""
+
+    code: int | None
+    stdout: str
+    stderr: str
+
+
+def execute(
+    cmd: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    stdin: bytes | None = None,
+    merge_stderr: bool = True,
+    on_timeout: Callable[[], None] | None = None,
+) -> Completed:
+    """Run ``cmd`` in its own process group; on timeout call ``on_timeout``, then kill the group.
+
+    With ``merge_stderr`` stderr is folded into stdout (in order); otherwise it is
+    returned separately. Output is decoded as UTF-8 with replacement.
+    """
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         env=env,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL if stdin is None else subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        errors="replace",
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         start_new_session=True,
     )
+    code: int | None
     try:
-        out, _ = proc.communicate(timeout=max(timeout, 0.001))
+        out, err = proc.communicate(input=stdin, timeout=max(timeout, 0.001))
+        code = proc.returncode
     except subprocess.TimeoutExpired:
+        if on_timeout is not None:
+            on_timeout()
         os.killpg(proc.pid, signal.SIGKILL)
-        out, _ = proc.communicate()
-        return None, out
-    return proc.returncode, out
+        out, err = proc.communicate()
+        code = None
+    return Completed(
+        code,
+        out.decode("utf-8", errors="replace"),
+        (err or b"").decode("utf-8", errors="replace"),
+    )
+
+
+def grader_argv(python: str, root: str) -> list[str]:
+    """``python -m pytest`` on ``root/tests`` with an empty ``root/pytest.ini`` as config."""
+    return [python, *PYTEST_ARGS, "--rootdir", root, "-c", f"{root}/pytest.ini", f"{root}/tests"]
+
+
+def stage_solution(task_dir: Path, solution: Stub | Literal["reference"], dest: Path) -> None:
+    """Write what runs as ``dest/solve.sh`` (and its siblings) for ``solution``."""
+    if isinstance(solution, Stub):
+        dest.mkdir()
+        (dest / SOLUTION_ENTRY).write_text(solution.script(), encoding="utf-8")
+    else:
+        shutil.copytree(task_dir / "solution", dest, ignore=_IGNORE, symlinks=True)
+
+
+def _files(root: Path) -> set[str]:
+    return {path.as_posix() for path in regular_files(root)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +226,14 @@ class LocalRunner:
     python: str = sys.executable
     """Interpreter that runs the grader; it must have pytest installed."""
 
-    def run(self, task_dir: Path, *, with_solution: bool, timeout_sec: float) -> RunResult:
+    @property
+    def name(self) -> str:
+        return "local"
+
+    def build(self, task_dir: Path) -> BuildResult:
+        return BuildResult(ok=True, message="not built: the local runner does not use Docker")
+
+    def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
         deadline = time.monotonic() + timeout_sec
         env = _child_env()
         with tempfile.TemporaryDirectory(prefix="taskgate-") as tmp:
@@ -124,39 +248,33 @@ class LocalRunner:
             (root / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
 
             solution_exit: int | None = None
-            if with_solution:
-                shutil.copytree(
-                    task_dir / "solution", root / "solution", ignore=_IGNORE, symlinks=True
+            created: tuple[str, ...] = ()
+            if solution != "none":
+                stage_solution(task_dir, solution, root / "solution")
+                before = _files(workspace)
+                done = execute(
+                    ["sh", str(root / "solution" / SOLUTION_ENTRY)],
+                    cwd=workspace,
+                    env=env,
+                    timeout=deadline - time.monotonic(),
                 )
-                solution_exit, out = _run(
-                    ["sh", str(root / "solution" / "solve.sh")],
-                    workspace,
-                    env,
-                    deadline - time.monotonic(),
-                )
-                if solution_exit is None:
-                    return RunResult(None, None, timed_out=True, output=_tail(out))
-                if solution_exit != 0:
-                    return RunResult(solution_exit, None, timed_out=False, output=_tail(out))
+                solution_exit = done.code
+                if done.code is None:
+                    return RunResult(None, None, timed_out=True, output=tail(done.stdout))
+                if done.code != 0:
+                    return RunResult(done.code, None, timed_out=False, output=tail(done.stdout))
+                created = tuple(sorted(_files(workspace) - before))
 
-            grader_exit, out = _run(
-                [
-                    self.python,
-                    "-m",
-                    "pytest",
-                    "-q",
-                    "-p",
-                    "no:cacheprovider",
-                    "--rootdir",
-                    str(root),
-                    "-c",
-                    str(root / "pytest.ini"),
-                    str(root / "tests"),
-                ],
-                workspace,
-                env,
-                deadline - time.monotonic(),
+            graded = execute(
+                grader_argv(self.python, str(root)),
+                cwd=workspace,
+                env=env,
+                timeout=deadline - time.monotonic(),
             )
             return RunResult(
-                solution_exit, grader_exit, timed_out=grader_exit is None, output=_tail(out)
+                solution_exit,
+                graded.code,
+                timed_out=graded.code is None,
+                output=tail(graded.stdout),
+                created=created,
             )

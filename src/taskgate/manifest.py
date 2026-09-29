@@ -17,6 +17,8 @@ from typing import Any
 DIFFICULTIES: tuple[str, ...] = ("easy", "medium", "hard")
 TIMEOUT_RANGE: tuple[int, int] = (1, 3600)
 DEFAULT_TIMEOUT_SEC = 120
+DEFAULT_DOCKERFILE = "Dockerfile"
+DEFAULT_WORKDIR = "/workspace"
 TASK_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SCHEMA: dict[str, tuple[str, ...]] = {
     "task": ("id", "title", "difficulty", "timeout_sec"),
@@ -62,6 +64,18 @@ class ManifestCheck:
         """The task's time budget, or the default when the manifest does not give a valid one."""
         declared = self.declared_timeout_sec
         return DEFAULT_TIMEOUT_SEC if declared is None else declared
+
+    @property
+    def dockerfile(self) -> str:
+        """``environment.dockerfile`` when it is a non-empty string, else ``Dockerfile``."""
+        value = _table(self.raw, "environment").get("dockerfile")
+        return value if isinstance(value, str) and value.strip() else DEFAULT_DOCKERFILE
+
+    @property
+    def workdir(self) -> str:
+        """``environment.workdir`` when it is an absolute path, else ``/workspace``."""
+        value = _table(self.raw, "environment").get("workdir")
+        return value if isinstance(value, str) and value.startswith("/") else DEFAULT_WORKDIR
 
 
 def _table(raw: dict[str, Any], key: str) -> dict[str, Any]:

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+from fakedocker import FakeDocker
 from gitrepo import GitRepo
 from taskfactory import GRADER, LENIENT_GRADER
 from taskfactory import make_task as make_runnable_task
@@ -348,3 +349,59 @@ def test_a_missing_config_file_is_a_usage_error(tmp_path: Path) -> None:
     result = runner.invoke(app, ["gates", "--config", str(tmp_path / "nope.toml")])
     assert result.exit_code == 2
     assert "cannot read" in result.output
+
+
+def test_check_runs_solutions_in_docker_when_asked(
+    repo: GitRepo, fake_docker: FakeDocker, tmp_path: Path
+) -> None:
+    pr_repo(repo)
+    config = tmp_path / "limits.toml"
+    config.write_text("[runner]\nmemory_mb = 256\n", encoding="utf-8")
+    args = [
+        "check",
+        str(repo.root),
+        "--base",
+        "main",
+        "--runner",
+        "docker",
+        "--config",
+        str(config),
+    ]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert "docker runner" in result.stdout.splitlines()[0]
+    runs = fake_docker.calls("run")
+    assert runs
+    assert {argv[argv.index("--memory") + 1] for argv in runs} == {"256m"}
+
+
+def test_auto_falls_back_to_the_local_runner_with_a_note(
+    repo: GitRepo, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_DAEMON", "down")
+    pr_repo(repo)
+    result = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--runner", "auto"])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0].endswith(", local runner")
+    assert "note: Docker is not available (the Docker daemon did not answer: " in result.stderr
+    assert fake_docker.calls("run") == []
+
+
+def test_runner_docker_without_a_daemon_is_a_usage_error(
+    repo: GitRepo, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_DOCKER_DAEMON", "down")
+    pr_repo(repo)
+    result = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--runner", "docker"])
+    assert result.exit_code == 2
+    assert "error: --runner docker: the Docker daemon did not answer" in result.stderr
+
+
+def test_the_runner_can_come_from_the_environment(
+    tmp_path: Path, fake_docker: FakeDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    make_runnable_task(tmp_path / "tasks" / "echo")
+    monkeypatch.setenv("TASKGATE_RUNNER", "docker")
+    result = runner.invoke(app, ["check", "--all", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines()[0] == "taskgate 0.1.0: all tasks, 1 task, docker runner"

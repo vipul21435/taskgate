@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from taskfactory import LENIENT_GRADER, make_task
-from taskgate.runner import LocalRunner, RunResult
+from taskgate.runner import LocalRunner, RunResult, Stub, execute
 
 
 @pytest.fixture
@@ -13,17 +13,19 @@ def runner() -> LocalRunner:
 
 def test_solution_run_passes_the_grader(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo")
-    result = runner.run(task, with_solution=True, timeout_sec=60)
+    result = runner.run(task, solution="reference", timeout_sec=60)
     assert result.solution_exit == 0
     assert result.grader_exit == 0
     assert result.grader_passed
     assert not result.timed_out
     assert result.summary == "1 passed"
+    assert result.created == ("output/greeting.txt",)
+    assert result.error is None
 
 
 def test_baseline_run_fails_the_grader(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo")
-    result = runner.run(task, with_solution=False, timeout_sec=60)
+    result = runner.run(task, solution="none", timeout_sec=60)
     assert result.solution_exit is None
     assert result.grader_exit == 1
     assert result.summary == "1 failed"
@@ -32,21 +34,21 @@ def test_baseline_run_fails_the_grader(tmp_path: Path, runner: LocalRunner) -> N
 def test_runs_leave_the_task_tree_untouched(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo")
     before = sorted(p.relative_to(task).as_posix() for p in task.rglob("*"))
-    runner.run(task, with_solution=True, timeout_sec=60)
+    runner.run(task, solution="reference", timeout_sec=60)
     after = sorted(p.relative_to(task).as_posix() for p in task.rglob("*"))
     assert after == before
 
 
 def test_lenient_grader_passes_an_empty_workspace(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo", grader=LENIENT_GRADER)
-    result = runner.run(task, with_solution=False, timeout_sec=60)
+    result = runner.run(task, solution="none", timeout_sec=60)
     assert result.grader_exit == 0
     assert result.summary == "1 skipped"
 
 
 def test_failing_solution_stops_before_the_grader(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo", solve="echo broken >&2\nexit 3\n")
-    result = runner.run(task, with_solution=True, timeout_sec=60)
+    result = runner.run(task, solution="reference", timeout_sec=60)
     assert result.solution_exit == 3
     assert result.grader_exit is None
     assert result.summary == "broken"
@@ -61,12 +63,12 @@ def test_task_without_a_workspace_seed_gets_an_empty_one(
         "    assert not any(Path().iterdir())\n"
     )
     task = make_task(tmp_path / "echo", workspace=False, grader=grader)
-    assert runner.run(task, with_solution=False, timeout_sec=60).grader_passed
+    assert runner.run(task, solution="none", timeout_sec=60).grader_passed
 
 
 def test_slow_solution_is_killed_at_the_deadline(tmp_path: Path, runner: LocalRunner) -> None:
     task = make_task(tmp_path / "echo", solve="sleep 30\n")
-    result = runner.run(task, with_solution=True, timeout_sec=0.5)
+    result = runner.run(task, solution="reference", timeout_sec=0.5)
     assert result.timed_out
     assert result.solution_exit is None
     assert result.grader_exit is None
@@ -75,7 +77,7 @@ def test_slow_solution_is_killed_at_the_deadline(tmp_path: Path, runner: LocalRu
 def test_slow_grader_is_killed_at_the_deadline(tmp_path: Path, runner: LocalRunner) -> None:
     grader = "import time\n\ndef test_slow() -> None:\n    time.sleep(30)\n"
     task = make_task(tmp_path / "echo", grader=grader)
-    result = runner.run(task, with_solution=False, timeout_sec=1.5)
+    result = runner.run(task, solution="none", timeout_sec=1.5)
     assert result.timed_out
     assert result.grader_exit is None
 
@@ -85,9 +87,74 @@ def test_pytest_environment_variables_do_not_leak(
 ) -> None:
     monkeypatch.setenv("PYTEST_ADDOPTS", "--this-flag-does-not-exist")
     task = make_task(tmp_path / "echo")
-    assert runner.run(task, with_solution=True, timeout_sec=60).grader_passed
+    assert runner.run(task, solution="reference", timeout_sec=60).grader_passed
 
 
 def test_summary_of_empty_output() -> None:
     result = RunResult(solution_exit=None, grader_exit=None, timed_out=True, output="\n\n")
     assert result.summary == "no output"
+
+
+def test_local_runner_does_not_build_images(tmp_path: Path, runner: LocalRunner) -> None:
+    built = runner.build(make_task(tmp_path / "echo"))
+    assert built.ok
+    assert built.image is None
+    assert built.message == "not built: the local runner does not use Docker"
+    assert runner.name == "local"
+
+
+def test_created_files_leave_out_seeded_changed_and_cache_files(
+    tmp_path: Path, runner: LocalRunner
+) -> None:
+    solve = (
+        "echo changed > input/name.txt\n"
+        "mkdir -p out/deep __pycache__\n"
+        "echo x > out/deep/a.txt\n"
+        "echo y > b.txt\n"
+        "echo z > __pycache__/c.pyc\n"
+    )
+    grader = "def test_ok() -> None:\n    pass\n"
+    task = make_task(tmp_path / "echo", solve=solve, grader=grader)
+    result = runner.run(task, solution="reference", timeout_sec=60)
+    assert result.created == ("b.txt", "out/deep/a.txt")
+
+
+def test_stub_creates_the_files_empty(tmp_path: Path, runner: LocalRunner) -> None:
+    exists_only = (
+        "from pathlib import Path\n\n"
+        "def test_exists() -> None:\n"
+        "    assert Path('output/greeting.txt').is_file()\n"
+    )
+    stub = Stub(("output/greeting.txt",))
+    strict = make_task(tmp_path / "strict")
+    assert runner.run(strict, solution=stub, timeout_sec=60).summary == "1 failed"
+    lenient = make_task(tmp_path / "lenient", grader=exists_only)
+    result = runner.run(lenient, solution=stub, timeout_sec=60)
+    assert result.grader_passed
+    assert result.created == ("output/greeting.txt",)
+
+
+def test_stub_script_quotes_paths_and_creates_parent_directories() -> None:
+    script = Stub(("a b/c.txt", "top.txt", "a b/d/e.txt")).script()
+    assert script.splitlines()[2:] == [
+        "set -eu",
+        "mkdir -p -- 'a b' 'a b/d'",
+        ": > 'a b/c.txt'",
+        ": > top.txt",
+        ": > 'a b/d/e.txt'",
+    ]
+    assert Stub().script().splitlines()[-1] == "set -eu"
+
+
+def test_execute_feeds_stdin_and_can_keep_stderr_apart() -> None:
+    done = execute(
+        ["sh", "-c", "cat; echo oops >&2"], timeout=30, stdin=b"piped\n", merge_stderr=False
+    )
+    assert (done.code, done.stdout, done.stderr) == (0, "piped\n", "oops\n")
+
+
+def test_execute_calls_the_timeout_hook_before_killing() -> None:
+    called: list[bool] = []
+    done = execute(["sleep", "30"], timeout=0.2, on_timeout=lambda: called.append(True))
+    assert done.code is None
+    assert called == [True]

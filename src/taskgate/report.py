@@ -27,7 +27,7 @@ def _plural(count: int, word: str) -> str:
 
 def _scope(report: CheckReport) -> str:
     if report.mode == "all":
-        return f"all tasks, {_plural(len(report.tasks), 'task')}"
+        return f"all tasks, {_plural(len(report.tasks), 'task')}, {report.runner} runner"
     merge_base = (report.merge_base or "")[:SHORT_SHA]
     scope = (
         f"diff against {report.base} (merge base {merge_base}), "
@@ -35,7 +35,7 @@ def _scope(report: CheckReport) -> str:
     )
     if report.other_files:
         scope += f", {_plural(len(report.other_files), 'other file')}"
-    return scope
+    return f"{scope}, {report.runner} runner"
 
 
 def describe_config(config: ConfigSummary) -> str | None:
@@ -168,6 +168,7 @@ def to_dict(report: CheckReport) -> dict[str, Any]:
     return {
         "taskgate_version": report.version,
         "mode": report.mode,
+        "runner": report.runner,
         "base": report.base,
         "merge_base": report.merge_base,
         "result": "pass" if report.passed else "fail",

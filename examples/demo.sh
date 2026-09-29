@@ -4,7 +4,11 @@
 # main). The good pull request must exit 0 and the bad one must exit 1.
 #
 # Usage: sh examples/demo.sh [WORKDIR]   (default: $TMPDIR/taskgate-demo)
+#
+# Solutions and graders run on the local runner unless TASKGATE_RUNNER says
+# otherwise (`make demo-docker` sets it to docker).
 set -eu
+export TASKGATE_RUNNER="${TASKGATE_RUNNER:-local}"
 
 work="${1:-${TMPDIR:-/tmp}/taskgate-demo}"
 here="$(cd "$(dirname "$0")" && pwd)"

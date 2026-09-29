@@ -8,6 +8,7 @@ from taskgate.config import (
     ConfigError,
     FileOptions,
     ManifestOptions,
+    RunnerOptions,
     SecretOptions,
     discover,
     load_file,
@@ -197,3 +198,36 @@ binary_allow = [1]
 def test_entropy_threshold_range() -> None:
     with pytest.raises(ConfigError, match=r"secrets.entropy_threshold 9.0 is outside 1.0..8.0"):
         parse("[secrets]\nentropy_threshold = 9.0\n", "taskgate.toml")
+
+
+def test_runner_section_sets_the_docker_limits() -> None:
+    text = "[runner]\ncpus = 2\nmemory_mb = 512\npids_limit = 128\nbuild_timeout_sec = 60\n"
+    config = parse(text, "taskgate.toml")
+    assert config.runner == RunnerOptions(
+        cpus=2.0, memory_mb=512, pids_limit=128, build_timeout_sec=60
+    )
+    assert dict(config.summary().options) == {
+        "runner.cpus": 2.0,
+        "runner.memory_mb": 512,
+        "runner.pids_limit": 128,
+        "runner.build_timeout_sec": 60,
+    }
+    assert Config().runner == RunnerOptions(
+        cpus=1.0, memory_mb=1024, pids_limit=256, build_timeout_sec=900
+    )
+
+
+def test_runner_section_problems_are_listed_at_once() -> None:
+    text = (
+        "[runner]\ncpus = 0\nmemory_mb = 32\npids_limit = 1.5\nbuild_timeout_sec = 9000\nswap = 1\n"
+    )
+    with pytest.raises(ConfigError) as error:
+        parse(text, "taskgate.toml")
+    assert str(error.value).splitlines() == [
+        "invalid taskgate.toml:",
+        "  unknown key runner.swap",
+        "  runner.cpus 0 is outside 0.1..64.0",
+        "  runner.memory_mb 32 is outside 64..65536",
+        "  runner.pids_limit must be an integer",
+        "  runner.build_timeout_sec 9000 is outside 10..7200",
+    ]

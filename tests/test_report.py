@@ -40,7 +40,7 @@ REPORT = CheckReport(
 def test_text_report() -> None:
     assert to_text(REPORT) == (
         "taskgate 9.9.9: diff against main (merge base 0123456), "
-        "3 changed tasks, 1 other file\n"
+        "3 changed tasks, 1 other file, local runner\n"
         "tasks/bad  added  FAIL\n"
         "  pass  TG101  layout-complete  layout complete\n"
         "  FAIL  TG402  baseline-fails   the grader passes an untouched workspace (1 skipped)\n"
@@ -58,7 +58,7 @@ def test_text_report() -> None:
 def test_text_report_for_an_empty_all_mode_run() -> None:
     report = CheckReport(version="9.9.9", mode="all")
     assert to_text(report) == (
-        "taskgate 9.9.9: all tasks, 0 tasks\n"
+        "taskgate 9.9.9: all tasks, 0 tasks, local runner\n"
         "no task directories to check\n"
         "result: PASS, 0 blocking failures\n"
     )
@@ -137,3 +137,10 @@ def test_default_config_adds_no_lines() -> None:
     assert describe_config(ConfigSummary()) is None
     assert "config" not in to_text(REPORT).lower()
     assert "Config:" not in to_markdown(REPORT)
+
+
+def test_the_runner_is_named_in_every_format() -> None:
+    report = CheckReport(version="9.9.9", mode="all", runner="docker")
+    assert to_text(report).startswith("taskgate 9.9.9: all tasks, 0 tasks, docker runner\n")
+    assert "0 blocking failures; all tasks, 0 tasks, docker runner." in to_markdown(report)
+    assert to_dict(report)["runner"] == "docker"

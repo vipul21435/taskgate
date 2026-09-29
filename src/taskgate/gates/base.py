@@ -16,16 +16,10 @@ from typing import Protocol, runtime_checkable
 
 from taskgate import manifest
 from taskgate.config import Config
+from taskgate.files import regular_files
 from taskgate.results import Severity, Status
-from taskgate.runner import LocalRunner, Runner, RunResult
+from taskgate.runner import BuildResult, LocalRunner, Runner, RunResult, Solution
 
-IGNORED_DIRS: frozenset[str] = frozenset(
-    {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
-)
-"""Directories that hold tool caches, never task content; gates do not see them."""
-
-IGNORED_FILES: frozenset[str] = frozenset({".DS_Store"})
-IGNORED_SUFFIXES: tuple[str, ...] = (".pyc",)
 BINARY_SNIFF_BYTES = 8000
 """Like git, a file is binary when a NUL byte appears in its first 8000 bytes."""
 
@@ -69,6 +63,8 @@ class TaskContext:
     config: Config = field(default_factory=Config)
     _manifest: manifest.ManifestCheck | None = field(default=None, repr=False)
     _files: tuple[PurePosixPath, ...] | None = field(default=None, repr=False)
+    _build: BuildResult | None = field(default=None, repr=False)
+    _runs: dict[Solution, RunResult] = field(default_factory=dict, repr=False)
 
     @property
     def manifest(self) -> manifest.ManifestCheck:
@@ -80,29 +76,25 @@ class TaskContext:
     def files(self) -> tuple[PurePosixPath, ...]:
         """Regular files in the task, relative and sorted; caches and symlinks are left out."""
         if self._files is None:
-            found: list[PurePosixPath] = []
-            for dirpath, dirnames, filenames in self.task_dir.walk():
-                dirnames[:] = sorted(d for d in dirnames if d not in IGNORED_DIRS)
-                for name in filenames:
-                    path = dirpath / name
-                    if (
-                        name in IGNORED_FILES
-                        or name.endswith(IGNORED_SUFFIXES)
-                        or path.is_symlink()
-                        or not path.is_file()
-                    ):
-                        continue
-                    found.append(PurePosixPath(path.relative_to(self.task_dir).as_posix()))
-            self._files = tuple(sorted(found))
+            self._files = regular_files(self.task_dir)
         return self._files
 
     def read_bytes(self, relative: PurePosixPath) -> bytes:
         return (self.task_dir / relative).read_bytes()
 
-    def run(self, *, with_solution: bool) -> RunResult:
-        return self.runner.run(
-            self.task_dir, with_solution=with_solution, timeout_sec=self.manifest.timeout_sec
-        )
+    def build(self) -> BuildResult:
+        """The runner's build of this task's environment (built at most once per context)."""
+        if self._build is None:
+            self._build = self.runner.build(self.task_dir)
+        return self._build
+
+    def run(self, solution: Solution = "reference") -> RunResult:
+        """Run ``solution`` and then the grader, once per distinct solution."""
+        if solution not in self._runs:
+            self._runs[solution] = self.runner.run(
+                self.task_dir, solution=solution, timeout_sec=self.manifest.timeout_sec
+            )
+        return self._runs[solution]
 
 
 @runtime_checkable

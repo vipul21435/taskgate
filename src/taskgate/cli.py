@@ -13,6 +13,7 @@ import typer
 from taskgate import __version__
 from taskgate.changes import GitError, changed_tasks, read_file_at, repo_root
 from taskgate.config import CONFIG_FILE, Config, ConfigError, discover, load_file, parse
+from taskgate.docker_runner import RunnerChoice, RunnerUnavailableError, select_runner
 from taskgate.engine import run_gates
 from taskgate.layout import TaskDir, find_tasks
 from taskgate.registry import (
@@ -25,6 +26,7 @@ from taskgate.registry import (
 )
 from taskgate.report import describe_config, to_json, to_markdown, to_text
 from taskgate.results import CheckReport, TaskReport
+from taskgate.runner import Runner
 
 app = typer.Typer(
     name="taskgate",
@@ -123,25 +125,45 @@ def _config_at(root: Path, ref: str) -> Config:
     return Config() if text is None else parse(text, f"{CONFIG_FILE} at {ref}")
 
 
-def _check_all(root: Path, config_path: Path | None) -> CheckReport:
+def _runner(choice: RunnerChoice, config: Config) -> Runner:
+    """The runner for ``--runner``; a fallback to the local runner is noted on stderr."""
+    try:
+        runner, note = select_runner(choice, config.runner)
+    except RunnerUnavailableError as exc:
+        raise _fail_usage(str(exc)) from exc
+    if note:
+        typer.echo(f"note: {note}", err=True)
+    return runner
+
+
+def _check_all(root: Path, config_path: Path | None, choice: RunnerChoice) -> CheckReport:
     try:
         found = find_tasks(root)
     except NotADirectoryError as exc:
         raise _fail_usage(str(exc)) from exc
     registry = _registry()
     config = _config(registry, config_path, lambda: discover(root))
+    runner = _runner(choice, config)
     tasks = tuple(
         TaskReport(
             path=task.path.as_posix(),
             change=None,
-            results=run_gates(root / task.path, gates=registry.gates, config=config),
+            results=run_gates(root / task.path, gates=registry.gates, config=config, runner=runner),
         )
         for task in found
     )
-    return CheckReport(version=__version__, mode="all", tasks=tasks, config=config.summary())
+    return CheckReport(
+        version=__version__,
+        mode="all",
+        tasks=tasks,
+        config=config.summary(),
+        runner=runner.name,
+    )
 
 
-def _check_diff(repo: Path, base: str | None, config_path: Path | None) -> CheckReport:
+def _check_diff(
+    repo: Path, base: str | None, config_path: Path | None, choice: RunnerChoice
+) -> CheckReport:
     try:
         root = repo_root(repo)
         changes = changed_tasks(root, base)
@@ -149,13 +171,14 @@ def _check_diff(repo: Path, base: str | None, config_path: Path | None) -> Check
         raise _fail_usage(str(exc)) from exc
     registry = _registry()
     config = _config(registry, config_path, lambda: _config_at(root, changes.base))
+    runner = _runner(choice, config)
     tasks = tuple(
         TaskReport(
             path=task.path.as_posix(),
             change=task.change,
             results=()
             if task.change == "removed"
-            else run_gates(root / task.path, gates=registry.gates, config=config),
+            else run_gates(root / task.path, gates=registry.gates, config=config, runner=runner),
             changed_files=task.files,
         )
         for task in changes.tasks
@@ -168,6 +191,7 @@ def _check_diff(repo: Path, base: str | None, config_path: Path | None) -> Check
         tasks=tasks,
         other_files=changes.other_files,
         config=config.summary(),
+        runner=runner.name,
     )
 
 
@@ -205,15 +229,26 @@ def check(
         OutputFormat, typer.Option("--format", help="What to print on stdout.")
     ] = OutputFormat.TEXT,
     config_path: ConfigOption = None,
+    runner_choice: Annotated[
+        RunnerChoice,
+        typer.Option(
+            "--runner",
+            envvar="TASKGATE_RUNNER",
+            help=(
+                "Where solutions and graders run: docker when the daemon answers, else "
+                "local (auto); docker only (exit 2 without it); or local only."
+            ),
+        ),
+    ] = RunnerChoice.AUTO,
 ) -> None:
     """Run the review gates on the tasks a pull request changes.
 
     Exits 0 when no blocking gate fails, 1 when one does, and 2 on usage errors.
     """
     report = (
-        _check_all(repo.resolve(), config_path)
+        _check_all(repo.resolve(), config_path, runner_choice)
         if all_tasks
-        else _check_diff(repo, base, config_path)
+        else _check_diff(repo, base, config_path, runner_choice)
     )
     typer.echo(RENDERERS[output_format](report), nl=False)
     if out is not None:
