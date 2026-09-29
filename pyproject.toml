@@ -52,6 +52,9 @@ files = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
+markers = [
+    "docker: needs a real Docker daemon; opt in with TASKGATE_DOCKER_TESTS=1 (make test-docker)",
+]
 
 [tool.coverage.run]
 source = ["taskgate"]

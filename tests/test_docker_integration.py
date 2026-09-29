@@ -1,0 +1,131 @@
+"""Opt-in: the Docker runner against a real Docker daemon.
+
+Run with ``make test-docker`` (``TASKGATE_DOCKER_TESTS=1 uv run pytest -m docker``).
+The tests skip unless that variable is 1 and the daemon answers. The first run
+builds the sample task's image (python:3.12-slim pinned by digest, plus pytest),
+which needs network access for the build only; later runs reuse the image by its
+content-derived tag. The containers themselves never get a network.
+"""
+
+import os
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+import pytest
+
+from taskgate.config import RunnerOptions
+from taskgate.docker_runner import DockerRunner, docker_status
+from taskgate.engine import run_gates
+from taskgate.results import Status
+
+pytestmark = pytest.mark.docker
+
+SAMPLE = Path(__file__).resolve().parents[1] / "examples" / "sample-repo" / "tasks"
+MEMORY_MB = 256
+PROBE_SOLVE = """\
+#!/bin/sh
+set -eu
+mkdir -p output
+id -u > output/uid.txt
+cat /sys/fs/cgroup/memory.max > output/memory.txt
+cat /sys/fs/cgroup/pids.max > output/pids.txt
+python3 - <<'PY'
+import socket
+try:
+    socket.create_connection(("1.1.1.1", 53), timeout=3)
+    state = "online"
+except OSError:
+    state = "offline"
+open("output/network.txt", "w").write(state)
+PY
+"""
+PROBE_GRADER = f"""\
+from pathlib import Path
+
+
+def read(name: str) -> str:
+    return Path("output", name).read_text().strip()
+
+
+def test_not_root() -> None:
+    assert read("uid.txt") != "0"
+
+
+def test_no_network() -> None:
+    assert read("network.txt") == "offline"
+
+
+def test_limits() -> None:
+    assert read("memory.txt") == str({MEMORY_MB} * 1024 * 1024)
+    assert read("pids.txt") == "256"
+"""
+
+
+@pytest.fixture(scope="module")
+def runner() -> DockerRunner:
+    if os.environ.get("TASKGATE_DOCKER_TESTS") != "1":
+        pytest.skip("set TASKGATE_DOCKER_TESTS=1 to run the tests against real Docker")
+    problem = docker_status()
+    if problem is not None:
+        pytest.skip(problem)
+    return DockerRunner(RunnerOptions(memory_mb=MEMORY_MB))
+
+
+def sample(tmp_path: Path) -> Path:
+    return Path(shutil.copytree(SAMPLE / "modular-inverse", tmp_path / "modular-inverse"))
+
+
+def docker(*args: str) -> str:
+    return subprocess.run(["docker", *args], capture_output=True, text=True, check=True).stdout
+
+
+def test_the_sample_task_passes_every_gate_in_docker(tmp_path: Path, runner: DockerRunner) -> None:
+    results = {r.code: r for r in run_gates(sample(tmp_path), runner=runner)}
+    assert {code: r.status for code, r in results.items()} == dict.fromkeys(results, Status.PASS)
+    image = runner.build(tmp_path / "modular-inverse").image
+    assert image is not None
+    assert results["TG301"].message == f"environment builds: image {image}"
+    assert docker("image", "inspect", "--format", '{{index .Config.Labels "project"}}', image) == (
+        "taskgate\n"
+    )
+
+
+def test_runs_have_no_network_no_root_and_the_configured_limits(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    task = sample(tmp_path)
+    (task / "solution" / "solve.sh").write_text(PROBE_SOLVE, encoding="utf-8")
+    (task / "tests" / "test_outputs.py").write_text(PROBE_GRADER, encoding="utf-8")
+    result = runner.run(task, solution="reference", timeout_sec=120)
+    assert result.grader_passed, result.output
+    assert result.summary == "3 passed"
+
+
+def test_a_memory_hog_is_killed(tmp_path: Path, runner: DockerRunner) -> None:
+    task = sample(tmp_path)
+    hog = "python3 -c \"data = b'x' * (512 * 1024 * 1024)\"\n"
+    (task / "solution" / "solve.sh").write_text(hog, encoding="utf-8")
+    result = runner.run(task, solution="reference", timeout_sec=120)
+    assert result.solution_exit == 137
+    assert result.grader_exit is None
+
+
+def test_a_slow_solution_is_stopped_and_its_container_removed(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    task = sample(tmp_path)
+    (task / "solution" / "solve.sh").write_text("sleep 60\n", encoding="utf-8")
+    started = time.monotonic()
+    result = runner.run(task, solution="reference", timeout_sec=5)
+    assert result.timed_out
+    assert time.monotonic() - started < 40
+    for _ in range(20):
+        left = docker(
+            "ps", "-aq", "--filter", "label=project=taskgate", "--filter", "name=taskgate-run-"
+        )
+        if not left.strip():
+            break
+        time.sleep(0.5)
+    assert left.strip() == ""

@@ -54,3 +54,17 @@ jobs:
             echo "expected a blocking failure for the incomplete draft task" >&2
             exit 1
           fi
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: "0.11.29"
+          python-version: "3.12"
+          enable-cache: true
+      - name: Install locked environment
+        run: uv sync --locked
+      - name: Demo on the Docker runner (task images built, runs offline with limits)
+        run: make demo-docker
+      - name: Publish the Docker-runner demo reports to the job summary
+        if: always()
+        run: cat .taskgate/demo-docker/out/pr/*/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Opt-in tests against the real Docker daemon
+        run: make test-docker
