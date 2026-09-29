@@ -42,7 +42,8 @@ def missing_parts(task_dir: Path) -> tuple[str, ...]:
     return tuple(missing)
 
 
-def _skipped(dirname: str) -> bool:
+def is_skipped_dir(dirname: str) -> bool:
+    """True for directories that are never scanned for tasks (hidden or tool-owned)."""
     return dirname.startswith(".") or dirname in SKIP_DIRS
 
 
@@ -62,5 +63,5 @@ def find_tasks(root: Path) -> list[TaskDir]:
             found.append(TaskDir(path=relative, missing=missing_parts(dirpath)))
             dirnames.clear()
             continue
-        dirnames[:] = [d for d in dirnames if not _skipped(d)]
+        dirnames[:] = [d for d in dirnames if not is_skipped_dir(d)]
     return sorted(found, key=lambda task: task.path.as_posix())
