@@ -1,0 +1,5 @@
+the quick brown fox
+
+jumps  over the   lazy dog
+a
+  leading and trailing spaces  

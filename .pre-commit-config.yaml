@@ -4,8 +4,11 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
+      # Task input data is byte-exact on purpose (trailing spaces included).
       - id: trailing-whitespace
+        exclude: ^examples/.*/environment/workspace/
       - id: end-of-file-fixer
+        exclude: ^examples/.*/environment/workspace/
       - id: check-toml
       - id: check-yaml
       - id: check-added-large-files

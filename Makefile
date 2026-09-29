@@ -3,6 +3,7 @@
 UV ?= uv
 IMAGE ?= taskgate:local
 SAMPLE ?= examples/sample-repo
+DEMO_DIR ?= .taskgate/demo
 
 install: ## Install the locked environment and the pre-commit hook
 	$(UV) sync --locked
@@ -27,12 +28,11 @@ cov: ## Run the tests with the coverage gate (fail_under in pyproject.toml)
 
 check: lint typecheck cov ## Everything CI runs except Docker
 
-demo: ## Offline demo on the bundled sample repository
-	$(UV) run taskgate version
+demo: ## Offline end to end: build a sample repo with two task pull requests and check both
 	$(UV) run taskgate tasks $(SAMPLE)
-	$(UV) run taskgate tasks --json $(SAMPLE)
+	$(UV) run sh examples/demo.sh $(DEMO_DIR)
 
 docker: ## Build the image, run the demo in it, prune this project's dangling images
 	docker build -t $(IMAGE) .
-	docker run --rm $(IMAGE) tasks $(SAMPLE)
+	docker run --rm --entrypoint sh $(IMAGE) examples/demo.sh /tmp/taskgate-demo
 	docker image prune -f --filter label=project=taskgate

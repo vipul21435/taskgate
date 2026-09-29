@@ -8,6 +8,10 @@ LABEL project=taskgate \
       org.opencontainers.image.licenses="MIT"
 
 COPY --from=uv /uv /usr/local/bin/uv
+# git is a runtime dependency: `taskgate check` diffs the pull request against its base.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/*
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     UV_PYTHON_DOWNLOADS=never \

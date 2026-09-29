@@ -1,0 +1,9 @@
+[task]
+id = "integer-determinant"
+title = "Exact determinants of small integer matrices"
+difficulty = "medium"
+timeout_sec = 120
+
+[environment]
+dockerfile = "Dockerfile"
+workdir = "/workspace"

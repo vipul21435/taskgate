@@ -31,8 +31,11 @@ jobs:
         run: make typecheck
       - name: Tests with coverage gate
         run: make cov
-      - name: Demo on the bundled sample repository
+      - name: Demo - build the sample repository and check both task pull requests
         run: make demo
+      - name: Publish the demo reports to the job summary
+        if: always()
+        run: cat .taskgate/demo/out/pr/*/report.md >> "$GITHUB_STEP_SUMMARY"
 
   docker:
     name: docker build + demo
@@ -44,10 +47,10 @@ jobs:
       - name: Run the demo inside the image
         run: |
           docker run --rm taskgate:ci version
-          docker run --rm taskgate:ci tasks examples/sample-repo
-      - name: Strict mode rejects the incomplete sample task
+          docker run --rm --entrypoint sh taskgate:ci examples/demo.sh /tmp/taskgate-demo
+      - name: Check every bundled sample task inside the image (the draft must be blocked)
         run: |
-          if docker run --rm taskgate:ci tasks --strict examples/sample-repo; then
-            echo "expected a non-zero exit for the incomplete sample task" >&2
+          if docker run --rm taskgate:ci check --all examples/sample-repo; then
+            echo "expected a blocking failure for the incomplete draft task" >&2
             exit 1
           fi
