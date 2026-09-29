@@ -2,8 +2,9 @@
 
 This sample task is deliberately flawed so the demo can show TaskGate blocking
 it: the tests skip when the output file is missing, so a workspace where the
-agent did nothing passes (gate TG402), and task.toml uses a difficulty value the
-schema does not allow (gate TG102).
+agent did nothing passes (gate TG402), task.toml uses a difficulty value the
+schema does not allow (gate TG102), and solution/solve.sh exports a leftover
+API key (gate TG201; the key is a random string, not a real credential).
 """
 
 from pathlib import Path

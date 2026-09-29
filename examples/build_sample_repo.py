@@ -9,7 +9,8 @@ overlays that directory's files onto the repository:
 
 - ``pr/1-integer-determinant`` adds a well-formed task (every gate passes);
 - ``pr/2-word-count`` adds a task whose grader skips when the output is missing,
-  so an untouched workspace passes, and whose manifest has an invalid difficulty.
+  so an untouched workspace passes, whose manifest has an invalid difficulty,
+  and whose solution script exports a leftover (fake) API key.
 
 Author, committer and dates are fixed, so the commit hashes (and therefore the
 reports TaskGate writes) are the same on every machine. DEST is deleted and

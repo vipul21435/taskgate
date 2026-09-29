@@ -58,16 +58,20 @@ def test_good_pull_request_passes_every_gate(sample_repo: Path) -> None:
     assert {gate["status"] for gate in task["gates"]} == {"pass"}
 
 
-def test_bad_pull_request_is_blocked_by_manifest_and_baseline_gates(sample_repo: Path) -> None:
+def test_bad_pull_request_is_blocked_by_manifest_secret_and_baseline_gates(
+    sample_repo: Path,
+) -> None:
     code, report = check_branch(sample_repo, "pr/2-word-count")
     assert code == 1
-    assert report["blocking_failures"] == 2
+    assert report["blocking_failures"] == 3
     (task,) = report["tasks"]
     failed = {gate["code"]: gate["message"] for gate in task["gates"] if gate["status"] == "fail"}
     assert failed == {
         "TG102": "task.difficulty 'trivial' is not one of easy, medium, hard",
+        "TG201": ("1 likely secret: solution/solve.sh:7 high-entropy string 'huG8...' (32 chars)"),
         "TG402": "the grader passes an untouched workspace (2 skipped)",
     }
+    assert "huG8GP38" not in json.dumps(report)
 
 
 def test_reports_are_byte_identical_across_builds(tmp_path: Path) -> None:
