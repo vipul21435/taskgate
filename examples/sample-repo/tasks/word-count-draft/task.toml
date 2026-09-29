@@ -1,0 +1,9 @@
+[task]
+id = "word-count-draft"
+title = "Word counts per line (draft, not ready for review)"
+difficulty = "easy"
+timeout_sec = 60
+
+[environment]
+dockerfile = "Dockerfile"
+workdir = "/workspace"

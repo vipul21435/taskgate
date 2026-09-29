@@ -1,0 +1,9 @@
+[task]
+id = "modular-inverse"
+title = "Modular inverses of integer pairs"
+difficulty = "easy"
+timeout_sec = 120
+
+[environment]
+dockerfile = "Dockerfile"
+workdir = "/workspace"
