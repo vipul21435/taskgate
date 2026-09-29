@@ -33,7 +33,25 @@ passes the same review gates before it is accepted.
   fallback. GitHub is reached only through a client with a configurable base
   URL, tested against an in-process fake API.
 - **Images:** digest-pinned slim bases, non-root user, `LABEL project=taskgate`;
-  `make docker` prunes only this project's dangling images.
+  `make docker` prunes only this project's dangling images. The image installs
+  `git` from Debian (not version-pinned) because `taskgate check` diffs with it.
+- **Core decisions (2026-09-30):**
+  - Changed tasks come from `git diff --no-renames <merge-base> HEAD`; task roots
+    at each ref come from `git ls-tree`, with the same outermost-`task.toml` rule
+    as the disk scan. A rename is a removed task plus an added task.
+  - The local runner copies workspace, solution and tests into a temp dir, runs
+    `sh solve.sh`, then the grader with TaskGate's own interpreter and an empty
+    `pytest.ini`; `pytest` moved from a dev to a runtime dependency for this.
+  - TG401/TG402 require TG101 (skipped otherwise); TG102 failures do not skip
+    them so authors see every problem in one run. pytest exit 5 (no tests) fails
+    TG402.
+  - `--out` is opt-in (no surprise writes); `--format` picks what goes to stdout.
+  - Demo pull requests live as overlays in `examples/pull-requests/<n-name>/`;
+    `examples/build_sample_repo.py` commits them with fixed metadata so hashes and
+    reports are identical on every machine (checked: macOS and the Linux image
+    produce byte-identical `report.md` and `report.json`).
+  - Writing the Markdown to `$GITHUB_STEP_SUMMARY` is done by the CI workflow,
+    not by TaskGate, until the GitHub slice.
 
 ## Scaffold (done)
 
@@ -45,7 +63,8 @@ passes the same review gates before it is accepted.
 
 ## Core (deliverable)
 
-- [ ] **`taskgate check`, smallest end to end.**
+- [x] **`taskgate check`, smallest end to end.** Done 2026-09-30: 89 tests,
+  100% branch coverage, CI green including the docker demo job.
   1. Changed-task discovery: `git diff --name-only base...HEAD` against
      `--base` (default `origin/main`, falling back to `main`), each path mapped to
      its enclosing task directory; deleted tasks are listed as removed and skipped.
