@@ -31,21 +31,77 @@ tasks/<id>/
 
 ## Runtime contract
 
-The working directory is the task's workspace: `/workspace` in the container
-(seeded from `environment/workspace/`), or a fresh temporary directory seeded
-the same way when Docker is not available.
+The working directory is the task's workspace: `environment.workdir`
+(`/workspace`) in the task's image, which the Dockerfile seeds by copying
+`environment/workspace/` into it, or a fresh temporary directory seeded from
+`environment/workspace/` when the local runner is used.
 
 1. `solution/solve.sh` runs with `sh`, with the workspace as its current
    directory, and writes its output there.
 2. The grader then runs `python -m pytest <tests dir>` from the same
    directory. Tests read only the workspace, never the solution.
 
-The local runner (implemented) copies `environment/workspace/`, `solution/` and
-`tests/` into a fresh temporary directory, so a run never writes into the task's
-source tree, and gives pytest an empty config file there so settings from the
-surrounding repository do not leak in. `solve.sh` and the grader share the
-`task.timeout_sec` budget; on timeout the whole process group is killed. The
-baseline run (TG402) skips step 1 and runs the grader on the untouched workspace.
+`solve.sh` and the grader share the `task.timeout_sec` budget. Three kinds of
+run use this contract: the reference solution (TG401), no solution at all, so
+the grader sees the untouched workspace (TG402), and a stub `solve.sh` that
+creates every file the reference solution created, empty, and nothing else
+(TG403). "Created" means a regular file that exists in the workspace after the
+reference `solve.sh` and did not before it; files it changed in place are left
+alone by the stub, and cache files (`__pycache__/`, `*.pyc`) do not count.
+
+### Runners
+
+`taskgate check --runner auto|docker|local` (or `TASKGATE_RUNNER`) picks where
+runs happen. `auto`, the default, uses Docker when `docker version` answers and
+otherwise the local runner, with a note on stderr; `docker` exits 2 without a
+daemon. The report header names the runner that was used.
+
+**Docker runner.** The image is built from `environment/<dockerfile>` with
+`environment/` as the build context, tagged `taskgate-env:<16 hex>` from a
+SHA-256 over the context (sorted paths, content, executable bits and symlink
+targets; caches left out), and labelled `project=taskgate` and
+`taskgate.context=<sha256>`. An image whose label matches is reused, so an
+unchanged environment is built once. Each run is a `docker run --rm` of that
+image with:
+
+- `--network none`, `--cpus 1`, `--memory 1024m --memory-swap 1024m` (no swap on
+  top), `--pids-limit 256`, `--cap-drop ALL`, `--security-opt no-new-privileges`;
+- the image's `USER`, or `65534:65534` when the image would run as root, and a
+  driver that refuses to run anything as uid 0;
+- `solution/` (or the stub) and `tests/` streamed in as a tar archive on stdin
+  and unpacked into a tmpfs at `/taskgate`, outside the workspace;
+- the workdir from `environment.workdir`, as the image provides it.
+
+When the budget runs out the container is killed (`docker kill`) and removed.
+The limits come from `[runner]` in `taskgate.toml` (`cpus`, `memory_mb`,
+`pids_limit`, `build_timeout_sec`, default 900 s for a build).
+
+**Local runner** (the fallback). It copies `environment/workspace/`, `solution/`
+(or the stub) and `tests/` into a fresh temporary directory, so a run never
+writes into the task's source tree, and gives pytest an empty config file there
+so settings from the surrounding repository do not leak in. On timeout the whole
+process group is killed. It is not a sandbox: it has no network or resource
+isolation and runs as the current user. The grader runs with TaskGate's own
+interpreter, so a task that needs packages beyond Python 3.12 and pytest only
+passes on the Docker runner.
+
+## Environment
+
+`environment/Dockerfile` (the name comes from `environment.dockerfile`) must stay
+inside `environment/`. Gate TG301 checks it without Docker on either runner:
+
+- every instruction is a known Dockerfile instruction, and `FROM` comes first
+  (only `ARG` may precede it);
+- every local `COPY`/`ADD` source exists in `environment/` (globs must match
+  something; heredocs, variables and URLs are not checked; `../` is refused);
+- the final stage sets a `USER` that is not `root` or `0`;
+- when `environment/workspace/` exists, some `COPY`/`ADD` copies it (or `.`) in.
+
+On the Docker runner TG301 also builds the image, and a failed build is reported
+with the last line of the build log. Gate TG302 lists every image the build
+pulls, `FROM` and `COPY --from=`, after substituting global `ARG` defaults, and
+requires each to end in `@sha256:<64 hex>`; `scratch` and earlier build stages
+need no digest, and a variable with no default counts as unpinned.
 
 ## Manifest
 
@@ -111,9 +167,13 @@ matches `/` (`tests/data/*` covers every file below `tests/data/`).
 | TG201 | no-secrets | yes | no text file holds a known token format, a private key or a high-entropy string |
 | TG202 | file-size-limits | yes | every file and the whole task are under the size limits |
 | TG203 | no-binary-files | yes | every binary file matches a `[files] binary_allow` glob |
+| TG301 | environment-builds | yes | the Dockerfile passes the checks under "Environment", and builds on the Docker runner (skipped without `environment/`) |
+| TG302 | base-images-pinned | yes | every `FROM` and `COPY --from` image is pinned by sha256 digest (skipped without a Dockerfile) |
 | TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
 | TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
+| TG403 | stub-solution-fails | yes | the grader fails after a stub that creates the reference solution's new files, empty (requires TG401) |
 
 A gate whose requirement did not pass is reported as `skip`, not as a second
-failure. `taskgate gates` prints the current list with each gate's effective
+failure. TG401 and TG402 also skip when the runner could not build the
+environment (TG301 says why). `taskgate gates` prints the current list with each gate's effective
 severity; `taskgate.toml` can disable a gate or change its severity.

@@ -105,6 +105,38 @@ passes the same review gates before it is accepted.
   - Test fixtures assemble fake tokens at runtime so no token literal is pushed;
     the demo's planted key is a random string with no known format.
 
+- **Slice 2 decisions (2026-09-30):**
+  - The `Runner` protocol has `name`, `build(task_dir)` and
+    `run(task_dir, solution=..., timeout_sec=...)`, where the solution is
+    `"reference"`, `"none"` or a `Stub`; `TaskContext` memoizes the build and
+    each distinct run, so TG401 and TG403 share one reference run.
+  - "No-op stub" (TG403) is read as: a generated `solve.sh` that creates every
+    file the reference solution created, empty, and does nothing else. A literal
+    `exit 0` stub would be the TG402 baseline again; the empty-output stub
+    catches graders that check only that an output exists (the third demo pull
+    request). Files the reference edits in place are left alone, so for
+    fix-the-code tasks the stub is a no-op.
+  - The Docker runner uses the image's own workdir (seeded by the Dockerfile's
+    `COPY workspace/`), not a copy TaskGate makes, because that is what an agent
+    sees; `solution/` and `tests/` are streamed in as a tar on stdin into a tmpfs
+    at `/taskgate`, so no bind mounts and no uid mapping are needed.
+  - Non-root: runs use the image's `USER`, or `65534:65534` when that would be
+    root, and the driver refuses uid 0. TG301's static checks require an explicit
+    non-root `USER` in the final stage (the base image's user is not visible
+    without Docker, and an explicit line is what review wants anyway).
+  - TG301 is static checks everywhere plus the build on the Docker runner, so both
+    runners report Dockerfile problems. TG401/TG402 skip (not fail) when the
+    build failed; TG301 and TG302 skip themselves when `environment/` or the
+    Dockerfile is missing instead of requiring TG101, so a task with a missing
+    `tests/` still gets its Dockerfile reviewed.
+  - `--runner auto|docker|local` (env `TASKGATE_RUNNER`) is a CLI choice, not a
+    `taskgate.toml` key: which isolation a CI job has is the CI owner's call;
+    `[runner]` in `taskgate.toml` (base ref) only sets limits. `make demo` pins
+    the local runner so its reports stay byte-identical with the image's;
+    `make demo-docker` is the Docker variant.
+  - Build failures are reported with the last build-log line, with BuildKit's
+    per-build `ref <id>::<id>` blanked so reports stay stable.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
@@ -146,7 +178,9 @@ passes the same review gates before it is accepted.
   (known token formats, private keys, high-entropy strings with an allowlist),
   file-size and binary-file limits. Each gate tested with passing and failing
   fixtures.
-- [ ] **2. Environment build and container runner.** A `Runner` protocol with a
+- [x] **2. Environment build and container runner.** Done 2026-09-30: 13 built-in
+  gates, 292 tests (plus 4 opt-in real-Docker tests, green locally and in CI),
+  100% branch coverage. A `Runner` protocol with a
   Docker runner (builds `environment/Dockerfile` under a content-derived tag and
   project label, runs the solution and the grader with `--network none`, CPU,
   memory and time limits, as a non-root user) and automatic fallback to the local
