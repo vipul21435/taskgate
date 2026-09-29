@@ -1,6 +1,7 @@
 import json
 import runpy
 import sys
+from importlib.metadata import EntryPoint
 from pathlib import Path
 
 import pytest
@@ -9,8 +10,10 @@ from typer.testing import CliRunner
 from gitrepo import GitRepo
 from taskfactory import GRADER, LENIENT_GRADER
 from taskfactory import make_task as make_runnable_task
-from taskgate import __version__
+from taskgate import __version__, registry
 from taskgate.cli import app
+from taskgate.gates import BUILTIN_GATES
+from taskgate.registry import ENTRY_POINT_GROUP
 
 SAMPLE_REPO = Path(__file__).resolve().parents[1] / "examples" / "sample-repo"
 runner = CliRunner()
@@ -166,3 +169,72 @@ def test_check_all_on_the_bundled_sample_repo() -> None:
 def test_check_all_rejects_a_missing_directory(tmp_path: Path) -> None:
     result = runner.invoke(app, ["check", "--all", str(tmp_path / "nope")])
     assert result.exit_code == 2
+
+
+def fake_plugins(monkeypatch: pytest.MonkeyPatch, *attrs: str) -> None:
+    eps = [
+        EntryPoint(name=attr.lower(), value=f"plugin_fixtures:{attr}", group=ENTRY_POINT_GROUP)
+        for attr in attrs
+    ]
+    monkeypatch.setattr(registry, "entry_points", lambda group: eps)
+
+
+def test_gates_lists_every_code_grouped_by_hundreds() -> None:
+    result = runner.invoke(app, ["gates"])
+    assert result.exit_code == 0
+    lines = result.output.splitlines()
+    assert lines[0] == "TG1xx  layout and manifest"
+    assert lines[1].startswith("  TG101  error    layout-complete  ")
+    assert "TG4xx  solution and baselines" in lines
+    assert lines[-1] == f"{len(BUILTIN_GATES)} gates: {len(BUILTIN_GATES)} built-in, 0 from plugins"
+    listed = [line.split()[0] for line in lines if line.startswith("  TG")]
+    assert listed == [g.code for g in BUILTIN_GATES]
+
+
+def test_gates_shows_plugin_gates_and_their_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_plugins(monkeypatch, "SINGLE")
+    result = runner.invoke(app, ["gates"])
+    assert result.exit_code == 0
+    assert "TG8xx  third-party" in result.output
+    assert "TG801  warning  single" in result.output
+    assert result.output.rstrip().endswith("1 from plugins")
+    assert "[plugin single]" in result.output
+
+
+def test_gates_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_plugins(monkeypatch, "PAIR")
+    data = json.loads(runner.invoke(app, ["gates", "--json"]).output)
+    assert data[0]["code"] == "TG101"
+    assert data[0]["group"] == "layout and manifest"
+    assert data[0]["source"] == "built-in"
+    assert data[-1] == {
+        "code": "TG803",
+        "name": "pair-two",
+        "group": "third-party",
+        "severity": "warning",
+        "summary": "a plugin gate",
+        "fix_hint": "fix it",
+        "requires": ["TG802"],
+        "source": "plugin pair",
+    }
+
+
+def test_a_broken_plugin_is_a_usage_error(monkeypatch: pytest.MonkeyPatch, repo: GitRepo) -> None:
+    fake_plugins(monkeypatch, "RESERVED")
+    listed = runner.invoke(app, ["gates"])
+    assert listed.exit_code == 2
+    assert "TG1xx-TG6xx are reserved for built-in gates" in listed.output
+    pr_repo(repo)
+    checked = runner.invoke(app, ["check", str(repo.root), "--base", "main"])
+    assert checked.exit_code == 2
+    assert "invalid gate registry" in checked.output
+
+
+def test_plugin_gates_run_in_check(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    fake_plugins(monkeypatch, "ClassGate")
+    make_runnable_task(tmp_path / "tasks" / "echo")
+    result = runner.invoke(app, ["check", "--all", str(tmp_path), "--format", "json"])
+    assert result.exit_code == 0, result.output
+    (task,) = json.loads(result.stdout)["tasks"]
+    assert task["gates"][-1]["code"] == "TG808"
+    assert task["gates"][-1]["message"] == "checked echo"

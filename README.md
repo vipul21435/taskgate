@@ -45,6 +45,13 @@ goes wrong.
   good task and one with a flawed task. Commits use fixed authors and dates, so
   the merge base (`b26918e`) and every report are identical on macOS and in the
   Linux container.
+- **A gate registry.** Every gate satisfies one `Gate` protocol (code, name,
+  severity, summary, fix hint, `requires`, `check(ctx)`); `taskgate gates`
+  lists every code grouped by hundreds. Third-party gates register through the
+  `taskgate.gates` entry-point group and must use TG7xx-TG9xx;
+  [examples/plugin](examples/plugin) is a working example (TG701). A plugin that
+  fails to load or breaks the contract stops the run with exit code 2, and a gate
+  that raises is reported as a failure instead of hiding the other results.
 - `taskgate tasks [ROOT]` lists task directories and the layout parts each lacks.
 - A digest-pinned Docker image (non-root user, git included) that runs the CLI
   and the demo, and GitHub Actions CI that runs lint, mypy, the tests with a
@@ -67,6 +74,7 @@ command exits 1 on purpose: the bundled draft task is incomplete.
 
 ```
 taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json]
+taskgate gates [--json]
 taskgate tasks [ROOT] [--json] [--strict]
 taskgate version
 ```
@@ -151,9 +159,11 @@ flowchart LR
 | `changes.py` | changed-task discovery from git, using the same task rules on `git ls-tree` of both refs |
 | `manifest.py` | `task.toml` parsing and schema validation that collects every problem |
 | `runner.py` | the `Runner` protocol and the local subprocess runner |
-| `gates.py` | gate definitions (code, name, severity, fix hint, requirements) and `run_gates` |
+| `gates/` | the `Gate` protocol, `TaskContext`, the `@gate` decorator and the built-in gates |
+| `registry.py` | built-in plus entry-point gates, validated and sorted by code |
+| `engine.py` | `run_gates`: runs gates in code order, skips unmet `requires`, contains gate crashes |
 | `report.py` | pure renderers from a `CheckReport` to text, Markdown and JSON |
-| `cli.py` | Typer commands `check`, `tasks`, `version` |
+| `cli.py` | Typer commands `check`, `gates`, `tasks`, `version` |
 
 ## Measured
 

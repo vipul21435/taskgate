@@ -2,7 +2,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from taskfactory import LENIENT_GRADER, make_task
-from taskgate.gates import GATES, Check, Gate, missing_layout, run_gates
+from taskgate.engine import run_gates
+from taskgate.gates import (
+    BUILTIN_GATES,
+    Check,
+    FunctionGate,
+    Gate,
+    TaskContext,
+    gate,
+    is_binary,
+    missing_layout,
+)
 from taskgate.results import GateResult, Severity, Status
 from taskgate.runner import RunResult
 
@@ -28,11 +38,11 @@ def by_code(results: tuple[GateResult, ...]) -> dict[str, GateResult]:
     return {result.code: result for result in results}
 
 
-def test_gate_codes_are_unique_and_well_formed() -> None:
-    codes = [gate.code for gate in GATES]
-    assert len(codes) == len(set(codes))
-    assert all(code.startswith("TG") and code[2:].isdigit() and len(code) == 5 for code in codes)
-    assert all(gate.fix_hint and gate.summary for gate in GATES)
+def test_builtin_gates_follow_the_protocol_and_run_in_code_order() -> None:
+    codes = [g.code for g in BUILTIN_GATES]
+    assert codes == sorted(set(codes))
+    assert all(isinstance(g, Gate) for g in BUILTIN_GATES)
+    assert all(g.fix_hint and g.summary for g in BUILTIN_GATES)
 
 
 def test_good_task_passes_every_gate(tmp_path: Path) -> None:
@@ -136,17 +146,19 @@ def test_baseline_failures_are_described(tmp_path: Path) -> None:
         assert results["TG402"].message == message
 
 
+def ok(_ctx: TaskContext) -> Check:
+    return Check.ok("fine")
+
+
+def failing(_ctx: TaskContext) -> Check:
+    return Check.fail("always fails")
+
+
 def test_custom_gate_list_and_requirements(tmp_path: Path) -> None:
-    def fail(_ctx: object) -> Check:
-        return Check(False, "always fails")
-
-    def ok(_ctx: object) -> Check:
-        return Check(True, "fine")
-
     gates = (
-        Gate("TG901", "first", Severity.WARNING, "s", "h", fail),
-        Gate("TG902", "second", Severity.INFO, "s", "h", ok, requires=("TG901",)),
-        Gate("TG903", "third", Severity.ERROR, "s", "h", ok, requires=("TG999",)),
+        FunctionGate("TG901", "first", Severity.WARNING, "s", "h", failing),
+        FunctionGate("TG902", "second", Severity.INFO, "s", "h", ok, requires=("TG901",)),
+        FunctionGate("TG903", "third", Severity.ERROR, "s", "h", ok, requires=("TG999",)),
     )
     results = run_gates(tmp_path, gates=gates)
     assert [(r.code, r.status) for r in results] == [
@@ -155,3 +167,65 @@ def test_custom_gate_list_and_requirements(tmp_path: Path) -> None:
         ("TG903", Status.SKIP),
     ]
     assert not results[0].blocking
+    assert results[0].fix_hint == "h"
+    assert results[1].fix_hint is None
+
+
+def test_a_gate_may_skip_itself(tmp_path: Path) -> None:
+    @gate("TG904", "not-applicable", severity=Severity.ERROR, summary="s", fix_hint="h")
+    def not_applicable(_ctx: TaskContext) -> Check:
+        return Check.skip("nothing to lint")
+
+    assert Check.ok("x").passed
+    assert not Check.skip("x").passed
+    (result,) = run_gates(tmp_path, gates=(not_applicable,))
+    assert (result.status, result.message, result.blocking) == (
+        Status.SKIP,
+        "nothing to lint",
+        False,
+    )
+
+
+def test_a_crashing_or_misbehaving_gate_fails_without_hiding_the_others(tmp_path: Path) -> None:
+    def crash(_ctx: TaskContext) -> Check:
+        raise ValueError("boom")
+
+    def wrong_type(_ctx: TaskContext) -> Check:
+        return "yes"  # type: ignore[return-value]
+
+    gates = (
+        FunctionGate("TG905", "crash", Severity.ERROR, "s", "h", crash),
+        FunctionGate("TG906", "wrong-type", Severity.WARNING, "s", "h", wrong_type),
+        FunctionGate("TG907", "fine", Severity.ERROR, "s", "h", ok),
+    )
+    results = by_code(run_gates(tmp_path, gates=gates))
+    assert results["TG905"].message == "gate raised ValueError: boom"
+    assert results["TG905"].blocking
+    assert results["TG906"].message == "gate returned str, not a Check"
+    assert results["TG907"].status is Status.PASS
+
+
+def test_context_lists_task_files_without_caches_or_symlinks(tmp_path: Path) -> None:
+    task = make_task(tmp_path / "echo")
+    (task / "tests" / "__pycache__").mkdir()
+    (task / "tests" / "__pycache__" / "x.pyc").write_bytes(b"\0")
+    (task / "tests" / "stale.pyc").write_bytes(b"\0")
+    (task / ".DS_Store").write_bytes(b"\0")
+    (task / "link.txt").symlink_to(task / "instruction.md")
+    ctx = TaskContext(task)
+    assert [p.as_posix() for p in ctx.files] == [
+        "environment/Dockerfile",
+        "environment/workspace/input/name.txt",
+        "instruction.md",
+        "solution/solve.sh",
+        "task.toml",
+        "tests/test_outputs.py",
+    ]
+    assert ctx.files is ctx.files
+    assert ctx.read_bytes(ctx.files[2]).startswith(b"Copy")
+
+
+def test_binary_detection_follows_the_git_rule() -> None:
+    assert is_binary(b"abc\0def")
+    assert not is_binary(b"plain text\n")
+    assert not is_binary(b"x" * 8000 + b"\0")

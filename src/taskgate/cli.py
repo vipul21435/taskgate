@@ -11,8 +11,16 @@ import typer
 
 from taskgate import __version__
 from taskgate.changes import GitError, changed_tasks, repo_root
-from taskgate.gates import run_gates
+from taskgate.engine import run_gates
 from taskgate.layout import TaskDir, find_tasks
+from taskgate.registry import (
+    GROUPS,
+    Registry,
+    RegistryError,
+    group_label,
+    group_of,
+    load_registry,
+)
 from taskgate.report import to_json, to_markdown, to_text
 from taskgate.results import CheckReport, TaskReport
 
@@ -90,13 +98,25 @@ def _fail_usage(message: str) -> typer.Exit:
     return typer.Exit(2)
 
 
+def _registry() -> Registry:
+    try:
+        return load_registry()
+    except RegistryError as exc:
+        raise _fail_usage(str(exc)) from exc
+
+
 def _check_all(root: Path) -> CheckReport:
     try:
         found = find_tasks(root)
     except NotADirectoryError as exc:
         raise _fail_usage(str(exc)) from exc
+    gates = _registry().gates
     tasks = tuple(
-        TaskReport(path=task.path.as_posix(), change=None, results=run_gates(root / task.path))
+        TaskReport(
+            path=task.path.as_posix(),
+            change=None,
+            results=run_gates(root / task.path, gates=gates),
+        )
         for task in found
     )
     return CheckReport(version=__version__, mode="all", tasks=tasks)
@@ -108,11 +128,12 @@ def _check_diff(repo: Path, base: str | None) -> CheckReport:
         changes = changed_tasks(root, base)
     except GitError as exc:
         raise _fail_usage(str(exc)) from exc
+    gates = _registry().gates
     tasks = tuple(
         TaskReport(
             path=task.path.as_posix(),
             change=task.change,
-            results=() if task.change == "removed" else run_gates(root / task.path),
+            results=() if task.change == "removed" else run_gates(root / task.path, gates=gates),
             changed_files=task.files,
         )
         for task in changes.tasks
@@ -162,6 +183,54 @@ def check(
         typer.echo(f"wrote {out / 'report.md'} and {out / 'report.json'}", err=True)
     if not report.passed:
         raise typer.Exit(1)
+
+
+def _gate_json(registry: Registry) -> list[dict[str, object]]:
+    return [
+        {
+            "code": entry.gate.code,
+            "name": entry.gate.name,
+            "group": GROUPS[group_of(entry.gate.code)],
+            "severity": entry.gate.severity.value,
+            "summary": entry.gate.summary,
+            "fix_hint": entry.gate.fix_hint,
+            "requires": list(entry.gate.requires),
+            "source": entry.source,
+        }
+        for entry in registry.entries
+    ]
+
+
+def _gate_lines(registry: Registry) -> list[str]:
+    entries = registry.entries
+    name_width = max(len(entry.gate.name) for entry in entries)
+    lines: list[str] = []
+    group = 0
+    for entry in entries:
+        gate = entry.gate
+        if group_of(gate.code) != group:
+            group = group_of(gate.code)
+            lines.append(group_label(group))
+        source = "" if entry.builtin else f"  [{entry.source}]"
+        lines.append(
+            f"  {gate.code}  {gate.severity.value:<7}  {gate.name:<{name_width}}  "
+            f"{gate.summary}{source}"
+        )
+    builtin = len(entries) - registry.plugin_count
+    lines.append(f"{len(entries)} gates: {builtin} built-in, {registry.plugin_count} from plugins")
+    return lines
+
+
+@app.command()
+def gates(
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead of text.")] = False,
+) -> None:
+    """List every gate code with its severity, name and what it checks."""
+    registry = _registry()
+    if as_json:
+        typer.echo(json.dumps(_gate_json(registry), indent=2))
+    else:
+        typer.echo("\n".join(_gate_lines(registry)))
 
 
 def main() -> None:
