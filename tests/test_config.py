@@ -6,7 +6,9 @@ from taskgate.config import (
     CONFIG_FILE,
     Config,
     ConfigError,
+    FileOptions,
     ManifestOptions,
+    SecretOptions,
     discover,
     load_file,
     parse,
@@ -128,3 +130,70 @@ def test_manifest_section_values(text: str, problem: str) -> None:
     with pytest.raises(ConfigError) as error:
         parse(text, "taskgate.toml")
     assert str(error.value).splitlines()[1:] == [f"  {problem}"]
+
+
+def test_secrets_and_files_sections() -> None:
+    text = """\
+[secrets]
+allow = ["^EXAMPLE"]
+exclude = ["tests/data/*"]
+min_length = 32
+entropy_threshold = 4.5
+
+[files]
+max_file_bytes = 2048
+max_task_bytes = 65536
+binary_allow = ["environment/workspace/*.png"]
+"""
+    config = parse(text, "taskgate.toml")
+    assert config.secrets == SecretOptions(
+        allow=("^EXAMPLE",), exclude=("tests/data/*",), min_length=32, entropy_threshold=4.5
+    )
+    assert config.files == FileOptions(
+        max_file_bytes=2048, max_task_bytes=65536, binary_allow=("environment/workspace/*.png",)
+    )
+    assert dict(config.summary().options) == {
+        "secrets.allow": ("^EXAMPLE",),
+        "secrets.exclude": ("tests/data/*",),
+        "secrets.min_length": 32,
+        "secrets.entropy_threshold": 4.5,
+        "files.max_file_bytes": 2048,
+        "files.max_task_bytes": 65536,
+        "files.binary_allow": ("environment/workspace/*.png",),
+    }
+    assert parse("[secrets]\nentropy_threshold = 5\n", "t").secrets.entropy_threshold == 5.0
+
+
+def test_secrets_and_files_problems_are_listed_at_once() -> None:
+    text = """\
+[secrets]
+allow = ["(unclosed"]
+exclude = "tests/*"
+min_length = 4
+entropy_threshold = "high"
+colour = 1
+
+[files]
+max_file_bytes = 0
+max_task_bytes = 1.5
+binary_allow = [1]
+"""
+    with pytest.raises(ConfigError) as error:
+        parse(text, "taskgate.toml")
+    lines = str(error.value).splitlines()
+    assert lines[0] == "invalid taskgate.toml:"
+    assert lines[1] == "  unknown key secrets.colour"
+    assert lines[2].startswith("  secrets.allow: '(unclosed' is not a valid regex (")
+    assert lines[3:] == [
+        "  secrets.exclude must be a list of strings",
+        "  secrets.min_length 4 is outside 8..1024",
+        "  secrets.entropy_threshold must be a number",
+        "  files.max_file_bytes 0 is outside 1..1099511627776",
+        "  files.max_task_bytes must be an integer",
+        "  files.binary_allow must be a list of strings",
+    ]
+
+
+def test_entropy_threshold_range() -> None:
+    with pytest.raises(ConfigError, match=r"secrets.entropy_threshold 9.0 is outside 1.0..8.0"):
+        parse("[secrets]\nentropy_threshold = 9.0\n", "taskgate.toml")

@@ -79,6 +79,26 @@ Gate TG104 warns when `timeout_sec` is valid but outside the recommended range,
 UTF-8 or has no text once HTML comments and Markdown headings are removed (a
 template left with only `# Title` and `<!-- TODO -->` is empty).
 
+## Hygiene
+
+Every file in the task (tool caches such as `__pycache__/` and symlinks are left
+out) is checked by three gates; the limits live in `taskgate.toml`:
+
+- **TG201** scans every text file for credentials: known token formats (cloud
+  access key ids, source-host, chat, payment and `sk-` style API keys, JSON web
+  tokens), private key headers, and high-entropy strings (see
+  `src/taskgate/secretscan.py` for the exact rule). Messages show only the first
+  four characters of a match. A line containing `taskgate: allow-secret` is
+  skipped; `[secrets] allow` (regexes on the matched text) and `exclude` (path
+  globs) cover the rest.
+- **TG202** fails a file over `[files] max_file_bytes` (default 1 MiB) or a task
+  over `max_task_bytes` (default 10 MiB) in total.
+- **TG203** fails a binary file (a NUL byte in its first 8000 bytes, git's rule)
+  unless a `[files] binary_allow` glob matches its task-relative path.
+
+Globs are matched with `fnmatch` on task-relative POSIX paths, so `*` also
+matches `/` (`tests/data/*` covers every file below `tests/data/`).
+
 ## Gates (implemented)
 
 | Code | Name | Blocks | Passes when |
@@ -88,6 +108,9 @@ template left with only `# Title` and `<!-- TODO -->` is empty).
 | TG103 | manifest-known-keys | no (warning) | `task.toml` has no tables or keys outside the schema (skipped when it does not parse) |
 | TG104 | timeout-in-range | no (warning) | `timeout_sec` is inside the recommended range (skipped when it is invalid) |
 | TG105 | instruction-not-empty | yes | `instruction.md` is UTF-8 and has text beyond headings and comments (skipped when missing) |
+| TG201 | no-secrets | yes | no text file holds a known token format, a private key or a high-entropy string |
+| TG202 | file-size-limits | yes | every file and the whole task are under the size limits |
+| TG203 | no-binary-files | yes | every binary file matches a `[files] binary_allow` glob |
 | TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
 | TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
 

@@ -12,10 +12,22 @@
     min_timeout_sec = 10
     max_timeout_sec = 1800
 
-Validation collects every problem before failing, and unknown sections, keys and
-gate codes are errors rather than silently ignored. In diff mode the file is read
-from the base ref, not from the pull request, so a pull request cannot relax the
-gates it is checked by.
+    [secrets]                    # TG201
+    allow = ["^EXAMPLE"]         # regexes; a finding whose text matches is dropped
+    exclude = ["tests/data/*"]   # task-relative path globs that are not scanned
+    min_length = 24              # shortest string the entropy detector looks at
+    entropy_threshold = 4.0      # bits per character
+
+    [files]                      # TG202, TG203
+    max_file_bytes = 1048576
+    max_task_bytes = 10485760
+    binary_allow = ["environment/workspace/*.png"]
+
+Globs use :func:`fnmatch.fnmatchcase` on task-relative POSIX paths, so ``*``
+also matches ``/``. Validation collects every problem before failing, and
+unknown sections, keys and gate codes are errors rather than silently ignored.
+In diff mode the file is read from the base ref, not from the pull request, so a
+pull request cannot relax the gates it is checked by.
 """
 
 from __future__ import annotations
@@ -33,6 +45,7 @@ from taskgate.results import ConfigSummary, OptionValue, Severity
 CONFIG_FILE = "taskgate.toml"
 CODE = re.compile(r"^TG[1-9][0-9]{2}$")
 SEVERITIES = ", ".join(s.value for s in Severity)
+MAX_BYTES = 1 << 40
 
 
 class ConfigError(ValueError):
@@ -47,8 +60,32 @@ class ManifestOptions:
     max_timeout_sec: int = 1800
 
 
-OptionSection = ManifestOptions
-"""The dataclasses behind the option sections (``[manifest]``)."""
+@dataclass(frozen=True, slots=True)
+class SecretOptions:
+    """TG201: what the secret scan ignores and how random a string must look."""
+
+    allow: tuple[str, ...] = ()
+    """Regexes; a finding whose matched text matches one is dropped."""
+
+    exclude: tuple[str, ...] = ()
+    """Task-relative path globs that are not scanned."""
+
+    min_length: int = 24
+    entropy_threshold: float = 4.0
+
+
+@dataclass(frozen=True, slots=True)
+class FileOptions:
+    """TG202 and TG203: size limits and the binary files a task may hold."""
+
+    max_file_bytes: int = 1 << 20
+    max_task_bytes: int = 10 << 20
+    binary_allow: tuple[str, ...] = ()
+    """Task-relative path globs of binary files that TG203 accepts."""
+
+
+OptionSection = ManifestOptions | SecretOptions | FileOptions
+"""The dataclasses behind the option sections (``[manifest]``, ``[secrets]``, ``[files]``)."""
 
 
 def _overrides(name: str, options: OptionSection) -> list[tuple[str, OptionValue]]:
@@ -71,6 +108,8 @@ class Config:
     disabled: frozenset[str] = frozenset()
     severity: Mapping[str, Severity] = field(default_factory=dict)
     manifest: ManifestOptions = ManifestOptions()
+    secrets: SecretOptions = SecretOptions()
+    files: FileOptions = FileOptions()
 
     def severity_for(self, code: str, default: Severity) -> Severity:
         return self.severity.get(code, default)
@@ -89,7 +128,11 @@ class Config:
             source=self.source,
             disabled=tuple(sorted(self.disabled)),
             severity=tuple(sorted(self.severity.items())),
-            options=tuple(_overrides("manifest", self.manifest)),
+            options=(
+                *_overrides("manifest", self.manifest),
+                *_overrides("secrets", self.secrets),
+                *_overrides("files", self.files),
+            ),
         )
 
 
@@ -130,6 +173,23 @@ class _Section:
             return value
         return default
 
+    def number(self, key: str, default: float, low: float, high: float) -> float:
+        value = self.table.get(key, default)
+        if not isinstance(value, int | float) or isinstance(value, bool):
+            self.problems.append(f"{self.name}.{key} must be a number")
+        elif not low <= value <= high:
+            self.problems.append(f"{self.name}.{key} {value} is outside {low}..{high}")
+        else:
+            return float(value)
+        return default
+
+    def strings(self, key: str) -> tuple[str, ...]:
+        value = self.table.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            self.problems.append(f"{self.name}.{key} must be a list of strings")
+            return ()
+        return tuple(value)
+
 
 def _codes(value: object, where: str, problems: _Problems) -> frozenset[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
@@ -164,18 +224,59 @@ def _manifest(raw: Mapping[str, Any], problems: _Problems) -> ManifestOptions:
     return ManifestOptions(min_timeout_sec=low, max_timeout_sec=high)
 
 
+def _regexes(sources: tuple[str, ...], where: str, problems: _Problems) -> tuple[str, ...]:
+    for source in sources:
+        try:
+            re.compile(source)
+        except re.error as exc:
+            problems.append(f"{where}: {source!r} is not a valid regex ({exc})")
+    return sources
+
+
+def _secrets(raw: Mapping[str, Any], problems: _Problems) -> SecretOptions:
+    keys = ("allow", "exclude", "min_length", "entropy_threshold")
+    section = problems.section(raw, "secrets", keys)
+    default = SecretOptions()
+    return SecretOptions(
+        allow=_regexes(section.strings("allow"), "secrets.allow", problems),
+        exclude=section.strings("exclude"),
+        min_length=section.integer("min_length", default.min_length, 8, 1024),
+        entropy_threshold=section.number("entropy_threshold", default.entropy_threshold, 1.0, 8.0),
+    )
+
+
+def _files(raw: Mapping[str, Any], problems: _Problems) -> FileOptions:
+    keys = ("max_file_bytes", "max_task_bytes", "binary_allow")
+    section = problems.section(raw, "files", keys)
+    default = FileOptions()
+    return FileOptions(
+        max_file_bytes=section.integer("max_file_bytes", default.max_file_bytes, 1, MAX_BYTES),
+        max_task_bytes=section.integer("max_task_bytes", default.max_task_bytes, 1, MAX_BYTES),
+        binary_allow=section.strings("binary_allow"),
+    )
+
+
 def from_dict(raw: Mapping[str, Any], source: str) -> Config:
     """Validate a parsed ``taskgate.toml``; raise :class:`ConfigError` listing every problem."""
     problems = _Problems()
-    problems.unknown(raw, ("gates", "manifest"), "")
+    problems.unknown(raw, ("gates", "manifest", "secrets", "files"), "")
     gates = problems.table(raw, "gates", "[gates]")
     problems.unknown(gates, ("disable", "severity"), "gates.")
     disabled = _codes(gates.get("disable", []), "gates.disable", problems)
     severity = _severities(problems.table(gates, "severity", "gates.severity"), problems)
     manifest = _manifest(raw, problems)
+    secrets = _secrets(raw, problems)
+    files = _files(raw, problems)
     if problems:
         raise ConfigError(f"invalid {source}:\n  " + "\n  ".join(problems))
-    return Config(source=source, disabled=disabled, severity=severity, manifest=manifest)
+    return Config(
+        source=source,
+        disabled=disabled,
+        severity=severity,
+        manifest=manifest,
+        secrets=secrets,
+        files=files,
+    )
 
 
 def parse(text: str, source: str) -> Config:
