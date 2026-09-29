@@ -3,7 +3,7 @@
 TaskGate runs review gates on pull requests that add or change benchmark tasks
 for AI coding agents: it finds the task directories a pull request touches,
 runs a set of gates on each one (schema, hygiene, environment build, reference
-solution passes, empty baseline fails, grader determinism, cheat probes), caches
+solution passes, empty or stub baseline fails, grader determinism), caches
 results by task content, and reports to the pull request. It mirrors the
 submission-pipeline side of benchmark-task work at an AI-data company: every task
 passes the same review gates before it is accepted.
@@ -24,7 +24,7 @@ passes the same review gates before it is accepted.
   `python -m pytest` from the task workspace after `solution/solve.sh`.
 - **Gate codes:** `TG` plus three digits, grouped by hundreds and never reused:
   TG1xx layout and manifest, TG2xx hygiene (secrets, sizes), TG3xx environment,
-  TG4xx solution and baselines, TG5xx determinism, TG6xx cheat probes.
+  TG4xx solution and baselines, TG5xx determinism, TG6xx reserved.
   Severities are `error` (blocking), `warning` and `info`.
 - **Exit codes:** 0 when no blocking gate fails, 1 when one does, 2 for usage
   errors (bad path, bad base ref).
@@ -66,6 +66,16 @@ passes the same review gates before it is accepted.
     disable the gates that check it. `--all` reads `<root>/taskgate.toml`;
     `--config` overrides both. Disabled gates are not reported; a gate whose
     requirement is disabled is skipped with "(disabled)" in the message.
+
+- **Spec change (2026-09-30):** the cheat-probe gates (TG6xx) were dropped from
+  the spec by the run orchestrator, so slice 3 is now grader determinism only and
+  TG6xx is kept as a reserved, unused range (plugins still start at TG7xx so the
+  plugin contract does not change).
+- **Slice 1 progress (2026-09-30):** the registry, `taskgate gates`, entry-point
+  plugins and `taskgate.toml` (disable, severity) are committed; the static gates
+  (manifest lint, secret scan, file-size limits) are still to do. An interrupted
+  agent's untested draft of them was stashed locally ("wip from interrupted
+  agent"), not committed.
 
 ## Scaffold (done)
 
@@ -115,14 +125,15 @@ passes the same review gates before it is accepted.
   `FROM` is digest-pinned (TG302), a no-op stub solution must fail the grader
   (TG403). Unit tests use a fake `docker` executable on PATH; one opt-in
   integration test uses real Docker.
-- [ ] **3. Grader determinism and cheat probe.** The determinism gate reruns the
-  grader N times (default 5) with a seeded shuffle of test order (a bundled pytest
-  plugin) and varied `PYTHONHASHSEED` and random seeds, and fails on any change
-  in verdict or per-test outcome (TG501). The cheat probe flags graders that only
-  check exit codes or have tests without assertions (TG601), graders that pass a
-  solution which writes literal expected output copied from the tests (TG602),
-  and tests or solutions that read files they must not (the solution reading
-  `tests/`, TG603).
+- [ ] **3. Grader determinism.** The determinism gate (TG501) reruns the grader
+  N times (default 5, `[determinism] runs` in `taskgate.toml`) on the reference
+  solution's output, each run with a seeded shuffle of test order (a small pytest
+  plugin bundled with TaskGate), a different `PYTHONHASHSEED` and a different
+  `TASKGATE_SEED`, and compares the verdict and every per-test outcome (read from
+  pytest's JUnit XML) across runs. A difference fails the gate and the report
+  lists each flaky test with the runs and seeds where it flipped, so the author
+  can reproduce it with one command. Tests use fixture tasks with a stable
+  grader, an order-dependent grader and a hash-seed-dependent grader.
 - [ ] **4. Content-hash result cache.** A canonical task hash (sorted relative
   POSIX paths, file bytes and executable bits, ignored files excluded, plus the
   TaskGate version and gate config) keys results stored under `.taskgate/cache`

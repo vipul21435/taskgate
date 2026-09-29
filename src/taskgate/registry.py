@@ -32,7 +32,7 @@ GROUPS: dict[int, str] = {
     3: "environment",
     4: "solution and baselines",
     5: "determinism",
-    6: "cheat probes",
+    6: "reserved",
     7: "third-party",
     8: "third-party",
     9: "third-party",

@@ -2,7 +2,7 @@
 
 Codes are ``TG`` plus three digits, grouped by hundreds and never reused:
 TG1xx layout and manifest, TG2xx hygiene, TG3xx environment, TG4xx solution and
-baselines, TG5xx determinism, TG6xx cheat probes. TG7xx to TG9xx belong to
+baselines, TG5xx determinism; TG6xx is reserved. TG7xx to TG9xx belong to
 third-party gates registered through the ``taskgate.gates`` entry-point group
 (see :mod:`taskgate.registry`).
 """

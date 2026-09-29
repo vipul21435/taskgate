@@ -228,18 +228,17 @@ flowchart LR
 
 ## Roadmap
 
-Planned in [PLAN.md](PLAN.md), none of it built yet:
+Planned in [PLAN.md](PLAN.md). The gate registry, plugins and `taskgate.toml`
+from slice 1 are built (see above); the rest is not built yet:
 
-1. A gate plugin registry (entry points, `taskgate gates`, a `taskgate.toml` to
-   disable gates or change severities) with secret, file-size and manifest lint
-   gates.
+1. Static gates: secret scan, file-size and binary-file limits, and manifest
+   lint (unknown keys, timeout range, empty instruction).
 2. A Docker runner that builds `environment/Dockerfile` and runs with no
    network and resource limits, with the local runner as the fallback; gates for
    the build (TG301), digest-pinned `FROM` lines (TG302) and a stub solution
    (TG403).
 3. Grader determinism over N reruns with shuffled test order and varied seeds
-   (TG501) and a cheat probe for exit-code-only graders, hardcoded outputs and
-   test-file reads (TG6xx).
+   (TG501), with the flaky tests and the seeds that flip them in the report.
 4. A content-hash result cache so unchanged tasks are skipped on re-runs.
 5. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
    XML, a fake GitHub API for tests and the demo, and a composite `action.yml`.
