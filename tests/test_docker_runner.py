@@ -18,6 +18,7 @@ from taskgate.docker_runner import (
     RunnerChoice,
     RunnerUnavailableError,
     build_archive,
+    build_error,
     context_digest,
     docker_status,
     image_tag,
@@ -401,3 +402,17 @@ def test_a_symlink_loop_is_not_a_dockerfile(tmp_path: Path) -> None:
     env.mkdir()
     (env / "loop").symlink_to("loop")
     assert locate(env, "loop") == "environment/loop is a symlink loop"
+
+
+def test_build_errors_drop_buildkit_cache_ids() -> None:
+    log = (
+        "#7 ERROR: failed to calculate checksum\n"
+        "ERROR: failed to build: failed to solve: failed to compute cache key: failed to "
+        'calculate checksum of ref i7ud3grebs6bn3egvnjgwsgyz::8wpgzy0uhmmqctd1sskj8q87v: "/input": '
+        "not found\n\n"
+    )
+    assert build_error(log) == (
+        "ERROR: failed to build: failed to solve: failed to compute cache key: failed to "
+        'calculate checksum of ref <id>: "/input": not found'
+    )
+    assert build_error("") == ""

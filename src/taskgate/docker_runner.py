@@ -25,6 +25,7 @@ import contextlib
 import hashlib
 import io
 import os
+import re
 import secrets
 import shutil
 import tarfile
@@ -66,6 +67,7 @@ KILL_TIMEOUT = 30.0
 OOM_EXIT = 137
 MARK = "@@taskgate-"
 DIGEST_VERSION = b"taskgate-env-v1"
+BUILDKIT_REF = re.compile(r"\bref [a-z0-9]+::[a-z0-9]+")
 
 DRIVER = f"""\
 nonce=$1 mode=$2 stage=$3
@@ -107,6 +109,15 @@ class RunnerUnavailableError(RuntimeError):
 def _last_line(text: str) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     return lines[-1] if lines else ""
+
+
+def build_error(log: str) -> str:
+    """The last line of a build log, with BuildKit's per-build cache ids blanked.
+
+    ``failed to calculate checksum of ref <id>::<id>`` changes on every build, and
+    reports must not change when the task did not.
+    """
+    return BUILDKIT_REF.sub("ref <id>", _last_line(log))
 
 
 def _docker_env() -> dict[str, str]:
@@ -372,7 +383,7 @@ class DockerRunner:
             if done.code != 0:
                 return BuildResult(
                     ok=False,
-                    message=f"docker build failed (exit {done.code}): {_last_line(done.stdout)}",
+                    message=f"docker build failed (exit {done.code}): {build_error(done.stdout)}",
                     output=tail(done.stdout),
                 )
             found = self._inspect(tag)
