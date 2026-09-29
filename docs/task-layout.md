@@ -35,10 +35,17 @@ The working directory is the task's workspace: `/workspace` in the container
 (seeded from `environment/workspace/`), or a fresh temporary directory seeded
 the same way when Docker is not available.
 
-1. `solution/solve.sh` runs with the workspace as its current directory and
-   writes its output there.
+1. `solution/solve.sh` runs with `sh`, with the workspace as its current
+   directory, and writes its output there.
 2. The grader then runs `python -m pytest <tests dir>` from the same
    directory. Tests read only the workspace, never the solution.
+
+The local runner (implemented) copies `environment/workspace/`, `solution/` and
+`tests/` into a fresh temporary directory, so a run never writes into the task's
+source tree, and gives pytest an empty config file there so settings from the
+surrounding repository do not leak in. `solve.sh` and the grader share the
+`task.timeout_sec` budget; on timeout the whole process group is killed. The
+baseline run (TG402) skips step 1 and runs the grader on the untouched workspace.
 
 ## Manifest
 
@@ -54,6 +61,20 @@ dockerfile = "Dockerfile"   # relative to environment/
 workdir = "/workspace"
 ```
 
-Today TaskGate checks only that the manifest and the other parts exist. Manifest
-schema validation and running the runtime contract are the core deliverable and
-the first slices in [PLAN.md](../PLAN.md).
+Gate TG102 validates the manifest: both tables present, `id` kebab-case and equal
+to the directory name, a non-empty `title`, `difficulty` one of the three values,
+`timeout_sec` an integer in 1..3600, and `workdir` an absolute path. Every problem
+is reported at once. Unknown keys are not flagged yet (see [PLAN.md](../PLAN.md),
+slice 1).
+
+## Gates (implemented)
+
+| Code | Name | Blocks | Passes when |
+| --- | --- | --- | --- |
+| TG101 | layout-complete | yes | the parts above exist, including `solution/solve.sh` and a `tests/test_*.py` (or `*_test.py`) file |
+| TG102 | manifest-valid | yes | `task.toml` matches the schema above |
+| TG401 | solution-passes | yes | `solve.sh` exits 0 and the grader then passes (requires TG101) |
+| TG402 | baseline-fails | yes | the grader fails on the untouched workspace, and collects at least one test (requires TG101) |
+
+A gate whose requirement did not pass is reported as `skip`, not as a second
+failure.
