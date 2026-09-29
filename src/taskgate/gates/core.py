@@ -1,5 +1,6 @@
 """Core gates: the layout and manifest schema (TG101, TG102) and the runtime checks
-that the reference solution passes (TG401) and an untouched workspace fails (TG402).
+that the reference solution passes (TG401), an untouched workspace fails (TG402)
+and a stub that creates the reference solution's new files, empty, fails (TG403).
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from pathlib import Path
 from taskgate.gates.base import Check, TaskContext, gate
 from taskgate.layout import missing_parts
 from taskgate.results import Severity
-from taskgate.runner import PYTEST_NO_TESTS, RunResult
+from taskgate.runner import PYTEST_NO_TESTS, RunResult, Stub
 
 SOLUTION_ENTRY = "solution/solve.sh"
 GRADER_GLOBS: tuple[str, ...] = ("test_*.py", "*_test.py")
@@ -113,4 +114,48 @@ def baseline_fails(ctx: TaskContext) -> Check:
     return Check.ok(f"an untouched workspace fails the grader ({run.summary})")
 
 
-CORE_GATES = (layout_complete, manifest_valid, solution_passes, baseline_fails)
+STUB_LISTED = 3
+
+
+def _stub_text(files: tuple[str, ...]) -> str:
+    if not files:
+        return "a no-op stub"
+    if len(files) == 1:
+        return f"a stub that writes {files[0]} empty"
+    shown = ", ".join(files[:STUB_LISTED])
+    more = f" and {len(files) - STUB_LISTED} more" if len(files) > STUB_LISTED else ""
+    return f"a stub that writes {len(files)} files empty ({shown}{more})"
+
+
+@gate(
+    "TG403",
+    "stub-solution-fails",
+    severity=Severity.ERROR,
+    summary="a stub that writes the reference solution's new files, empty, fails the grader",
+    fix_hint=(
+        "Make the grader check what each output contains, not only that it exists: "
+        "compare exact content or line counts (zip(..., strict=True)), so empty "
+        "placeholder files cannot pass."
+    ),
+    requires=("TG401",),
+)
+def stub_solution_fails(ctx: TaskContext) -> Check:
+    created = ctx.run("reference").created
+    run = ctx.run(Stub(created))
+    stub = _stub_text(created)
+    if run.error is None and not run.timed_out and run.solution_exit not in (None, 0):
+        return Check.fail(f"the stub solution exited {run.solution_exit}: {run.summary}")
+    if run.error is not None or run.timed_out or run.grader_exit == PYTEST_NO_TESTS:
+        return Check.fail(_run_failure(run, "the stub run", ctx.manifest.timeout_sec))
+    if run.grader_passed:
+        return Check.fail(f"the grader passes {stub} ({run.summary})")
+    return Check.ok(f"{stub} fails the grader ({run.summary})")
+
+
+CORE_GATES = (
+    layout_complete,
+    manifest_valid,
+    solution_passes,
+    baseline_fails,
+    stub_solution_fails,
+)

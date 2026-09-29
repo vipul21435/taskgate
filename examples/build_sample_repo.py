@@ -10,7 +10,10 @@ overlays that directory's files onto the repository:
 - ``pr/1-integer-determinant`` adds a well-formed task (every gate passes);
 - ``pr/2-word-count`` adds a task whose grader skips when the output is missing,
   so an untouched workspace passes, whose manifest has an invalid difficulty,
-  and whose solution script exports a leftover (fake) API key.
+  and whose solution script exports a leftover (fake) API key;
+- ``pr/3-gcd-pairs`` adds a task whose grader compares lines with a non-strict
+  ``zip()``, so an empty output file passes, and whose Dockerfile names its base
+  image by tag only.
 
 Author, committer and dates are fixed, so the commit hashes (and therefore the
 reports TaskGate writes) are the same on every machine. DEST is deleted and

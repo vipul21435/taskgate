@@ -41,9 +41,14 @@ def sample_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return dest
 
 
-def test_builder_creates_main_and_two_pull_request_branches(sample_repo: Path) -> None:
+def test_builder_creates_main_and_three_pull_request_branches(sample_repo: Path) -> None:
     branches = git(sample_repo, "branch", "--format=%(refname:short)").split()
-    assert branches == ["main", "pr/1-integer-determinant", "pr/2-word-count"]
+    assert branches == [
+        "main",
+        "pr/1-integer-determinant",
+        "pr/2-word-count",
+        "pr/3-gcd-pairs",
+    ]
     assert git(sample_repo, "status", "--porcelain") == ""
 
 
@@ -72,6 +77,20 @@ def test_bad_pull_request_is_blocked_by_manifest_secret_and_baseline_gates(
         "TG402": "the grader passes an untouched workspace (2 skipped)",
     }
     assert "huG8GP38" not in json.dumps(report)
+
+
+def test_existence_only_grader_and_unpinned_base_are_blocked(sample_repo: Path) -> None:
+    code, report = check_branch(sample_repo, "pr/3-gcd-pairs")
+    assert code == 1
+    assert report["blocking_failures"] == 2
+    (task,) = report["tasks"]
+    status = {gate["code"]: gate["status"] for gate in task["gates"]}
+    assert status["TG402"] == "pass"
+    failed = {gate["code"]: gate["message"] for gate in task["gates"] if gate["status"] == "fail"}
+    assert failed == {
+        "TG302": "1 image is not pinned by digest: line 3: FROM python:3.12-slim",
+        "TG403": "the grader passes a stub that writes output/gcds.txt empty (2 passed)",
+    }
 
 
 def test_reports_are_byte_identical_across_builds(tmp_path: Path) -> None:

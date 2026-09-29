@@ -14,7 +14,7 @@ from taskgate.gates import (
     missing_layout,
 )
 from taskgate.results import GateResult, Severity, Status
-from taskgate.runner import BuildResult, RunResult, Solution
+from taskgate.runner import BuildResult, RunResult, Solution, Stub
 
 
 @dataclass
@@ -23,6 +23,7 @@ class FakeRunner:
 
     reference: RunResult
     baseline: RunResult
+    stub: RunResult = field(default_factory=lambda: FAILED)
     built: BuildResult = field(default_factory=lambda: BuildResult(ok=True, message="fake"))
     calls: list[tuple[Path, Solution, float]] = field(default_factory=list)
 
@@ -35,7 +36,9 @@ class FakeRunner:
 
     def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult:
         self.calls.append((task_dir, solution, timeout_sec))
-        return self.reference if solution == "reference" else self.baseline
+        if solution == "reference":
+            return self.reference
+        return self.baseline if solution == "none" else self.stub
 
 
 PASSED = RunResult(0, 0, timed_out=False, output="3 passed in 0.01s")
@@ -111,7 +114,7 @@ def test_runner_gets_the_manifest_timeout(tmp_path: Path) -> None:
     task = make_task(tmp_path / "echo", timeout=42)
     runner = FakeRunner(reference=PASSED, baseline=FAILED)
     run_gates(task, runner=runner)
-    assert runner.calls == [(task, "reference", 42), (task, "none", 42)]
+    assert runner.calls == [(task, "reference", 42), (task, "none", 42), (task, Stub(), 42)]
 
 
 def test_runs_are_skipped_when_the_environment_does_not_build(tmp_path: Path) -> None:
@@ -123,6 +126,7 @@ def test_runs_are_skipped_when_the_environment_does_not_build(tmp_path: Path) ->
     for code in ("TG401", "TG402"):
         assert results[code].status is Status.SKIP
         assert results[code].message == "skipped: the environment did not build (see TG301)"
+    assert results["TG403"].message == "skipped: requires TG401 to pass"
     assert runner.calls == []
 
 

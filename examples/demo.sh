@@ -34,8 +34,9 @@ check_branch() {
 
 check_branch pr/1-integer-determinant 0
 check_branch pr/2-word-count 1
+check_branch pr/3-gcd-pairs 1
 git -C "$repo" checkout -q main
 
 echo
-echo "demo ok: the good pull request passed and the bad one was blocked"
+echo "demo ok: the good pull request passed and both bad ones were blocked"
 echo "reports: $work/out"
