@@ -341,6 +341,32 @@ passes the same review gates before it is accepted.
   - Docker-runner and local-runner demo reports plus the `--pr 4` run are 15
     files, byte-identical between macOS and the image.
 
+- **Review fixes, recovered from an interrupted agent (2026-09-30):** a
+  resumed run found uncommitted review fixes in the working tree. They were
+  checked (lint, mypy, the full suite) and committed as four units rather than
+  stashed, because each was complete and tested:
+  - `changes.py`: a non-UTF-8 path in git's output is a `GitError` (exit 2),
+    not an uncaught `UnicodeDecodeError`.
+  - `dockerfile.py`: flag words are read like Docker's `extractBuilderFlags`
+    (quotes and backslash escapes removed, `--` ends the flags), so TG302 sees
+    a quoted `RUN --mount="...,from=x"` or `COPY --from="x"`.
+  - `github.py`: redirects are refused (urllib would forward the token to the
+    `Location` host), and check-run summaries are cut at 65535 UTF-8 bytes on
+    a character boundary; the fake answers 422 to both oversize bodies.
+  - `cache.py` (cache format 2): a replay must carry exactly the enabled
+    gates' codes; a cache directory the checked repository tracks is not used;
+    `stats` and `prune` act only on a directory with TaskGate's `CACHEDIR.TAG`
+    and only on key-named regular files in a real `entries/` directory, and a
+    dry run writes nothing, not even the lock file; plugin gates add their
+    entry point, distribution version, object parameters and one hop of
+    imported source and constants to the key. The resuming run added the tests
+    that bring `cache.py` back to 100% branch coverage, routed both git calls
+    through one helper, and fixed a `ValueError` when the cache path reaches
+    the work tree through a symlink (`/var` versus `/private/var`).
+  - The older stash `wip from interrupted agent` (slice 1 static gates) is
+    superseded by the committed gates and is kept only because stashes are
+    never dropped by these runs.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license

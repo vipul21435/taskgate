@@ -236,7 +236,7 @@ def test_prune_while_another_process_holds_the_lock_is_a_usage_error(
     tmp_path: Path, private_result_cache: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr("taskgate.cli.ResultCache", partial(ResultCache, lock_timeout=0.1))
-    private_result_cache.mkdir()
+    ResultCache(private_result_cache).store("a" * 64, task="t", runner="local", results=())
     fd = os.open(private_result_cache / LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:

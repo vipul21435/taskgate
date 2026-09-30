@@ -46,11 +46,24 @@ class RegistryError(ValueError):
 
 
 @dataclass(frozen=True, slots=True)
+class PluginSource:
+    """The entry point a third-party gate was loaded through."""
+
+    entry_point: str
+    """The entry point's value, ``module:attribute``."""
+
+    distribution: str | None
+    """``name version`` of the distribution that declared it, when it is installed."""
+
+
+@dataclass(frozen=True, slots=True)
 class Registered:
     """A gate and where it came from (``built-in`` or ``plugin NAME``)."""
 
     gate: Gate
     source: str
+    plugin: PluginSource | None = None
+    """How the gate was loaded, for third-party gates (``None`` for built-in ones)."""
 
     @property
     def builtin(self) -> bool:
@@ -115,7 +128,9 @@ def load_plugins(eps: Iterable[EntryPoint] | None = None) -> list[Registered]:
             raise
         except Exception as exc:
             raise RegistryError(f"{origin}: {type(exc).__name__}: {exc}") from exc
-        loaded.extend(Registered(gate, f"plugin {ep.name}") for gate in gates)
+        dist = ep.dist
+        plugin = PluginSource(ep.value, None if dist is None else f"{dist.name} {dist.version}")
+        loaded.extend(Registered(gate, f"plugin {ep.name}", plugin) for gate in gates)
     return loaded
 
 

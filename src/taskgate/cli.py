@@ -181,7 +181,7 @@ def _checks(
     root: Path, cache: CacheSettings, registry: Registry, config: Config, runner: Runner
 ) -> CachedChecks:
     store = None if cache.off else ResultCache(_cache_dir(root, cache.directory))
-    return CachedChecks(store, registry.gates, config, runner, note=_note)
+    return CachedChecks(store, registry.entries, config, runner, note=_note)
 
 
 def _task_report(
@@ -201,7 +201,7 @@ def _task_report(
         tracked=tracked,
         compute=lambda: run_gates(
             root / path,
-            gates=checks.gates,
+            gates=checks.checked,
             config=checks.config,
             runner=checks.runner,
             tracked=tracked,

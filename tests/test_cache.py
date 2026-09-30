@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from gitrepo import GitRepo
 from taskfactory import make_task
 from taskgate import cache as cache_module
 from taskgate.cache import (
@@ -29,7 +31,8 @@ from taskgate.cache import (
     task_digest,
 )
 from taskgate.config import Config, DeterminismOptions, FileOptions
-from taskgate.gates import BUILTIN_GATES, Check, gate
+from taskgate.gates import BUILTIN_GATES, Check, Gate, gate
+from taskgate.registry import PluginSource, Registered
 from taskgate.results import GateResult, Severity, Status
 from taskgate.runner import LocalRunner
 
@@ -464,14 +467,21 @@ def test_counts_add_up_across_runs(tmp_path: Path) -> None:
 # --- prune and stats -------------------------------------------------------------------
 
 
-def aged(store: ResultCache, key: str, task: str, when: float, runner: str = "local") -> Path:
+def hexkey(name: str) -> str:
+    """A key-shaped (64 hex digit) file stem for a short test name."""
+    return hashlib.sha256(name.encode()).hexdigest()
+
+
+def aged(store: ResultCache, name: str, task: str, when: float, runner: str = "local") -> Path:
+    key = hexkey(name)
     store.store(key, task=task, runner=runner, results=(PASS,))
     os.utime(store.entry_path(key), (when, when))
     return store.entry_path(key)
 
 
 def names(entries: tuple[cache_module.Entry, ...]) -> list[str]:
-    return [entry.path.stem for entry in entries]
+    known = {hexkey(n): n for n in ("old", "new", "mid", "docker", "b", "stale", "broken")}
+    return sorted(known[entry.path.stem] for entry in entries)
 
 
 def test_prune_keeps_the_latest_entry_per_task_and_runner(tmp_path: Path) -> None:
@@ -485,8 +495,10 @@ def test_prune_keeps_the_latest_entry_per_task_and_runner(tmp_path: Path) -> Non
     stale = aged(store, "stale", "tasks/b", now)
     data = json.loads(stale.read_text(encoding="utf-8"))
     stale.write_text(json.dumps({**data, "taskgate": "0.0.1+000000000000"}), encoding="utf-8")
-    store.entry_path("broken").write_text("{", encoding="utf-8")
+    store.entry_path(hexkey("broken")).write_text("{", encoding="utf-8")
     (store.entries_dir / ".tmp-leftover").write_text("half", encoding="utf-8")
+    foreign = store.entries_dir / "settings.json"
+    foreign.write_text('{"theme": "dark"}', encoding="utf-8")
 
     stats = store.stats()
     assert (len(stats.entries), stats.current, stats.tasks) == (7, 5, 2)
@@ -499,16 +511,15 @@ def test_prune_keeps_the_latest_entry_per_task_and_runner(tmp_path: Path) -> Non
         "superseded": ["mid", "old"],
     }
     assert names(preview.kept) == ["b", "docker", "new"]
-    assert len(list(store.entries_dir.iterdir())) == 8
+    assert len(list(store.entries_dir.iterdir())) == 9
 
     pruned = store.prune(now=now)
     assert pruned.count == 4
     assert pruned.size > 0
-    assert sorted(p.name for p in store.entries_dir.iterdir()) == [
-        "b.json",
-        "docker.json",
-        "new.json",
-    ]
+    assert sorted(p.name for p in store.entries_dir.iterdir()) == sorted(
+        [f"{hexkey(n)}.json" for n in ("b", "docker", "new")] + ["settings.json"]
+    )
+    assert foreign.read_text(encoding="utf-8") == '{"theme": "dark"}'  # not key-named: untouched
     assert store.prune(now=now).count == 0
 
     unused = store.prune(now=now, older_than_sec=200)
@@ -518,7 +529,7 @@ def test_prune_keeps_the_latest_entry_per_task_and_runner(tmp_path: Path) -> Non
     everything = store.prune(everything=True)
     assert names(everything.removed["all"]) == ["b", "new"]
     assert everything.kept == ()
-    assert list(store.entries_dir.iterdir()) == []
+    assert [p.name for p in store.entries_dir.iterdir()] == ["settings.json"]
 
 
 def test_prune_and_stats_on_a_missing_cache(tmp_path: Path) -> None:
@@ -567,8 +578,15 @@ class Recorder:
         return self.results
 
 
-def checks(store: ResultCache | None, notes: list[str]) -> CachedChecks:
-    return CachedChecks(store, BUILTIN_GATES, Config(), LocalRunner(), note=notes.append)
+def gates_of(*results: GateResult) -> tuple[Gate, ...]:
+    """The built-in gates that report ``results``, so a replay carries exactly those codes."""
+    codes = {result.code for result in results}
+    return tuple(g for g in BUILTIN_GATES if g.code in codes)
+
+
+def checks(store: ResultCache | None, notes: list[str], *results: GateResult) -> CachedChecks:
+    gates = gates_of(*(results or (PASS, WARN)))
+    return CachedChecks(store, gates, Config(), LocalRunner(), note=notes.append)
 
 
 def test_a_passing_task_is_stored_and_then_skipped(task: Path, tmp_path: Path) -> None:
@@ -601,7 +619,7 @@ def test_a_blocking_failure_is_never_stored(task: Path, tmp_path: Path) -> None:
     store = ResultCache(tmp_path / "cache")
     compute = Recorder(PASS, BLOCK)
     for _ in range(2):
-        run = checks(store, [])
+        run = checks(store, [], PASS, BLOCK)
         assert run.results(task, label="t", tracked=None, compute=compute)[1] is False
         run.close()
     assert compute.calls == 2
@@ -611,7 +629,7 @@ def test_a_blocking_failure_is_never_stored(task: Path, tmp_path: Path) -> None:
 
 def test_without_a_cache_every_task_runs(task: Path, tmp_path: Path) -> None:
     compute = Recorder(PASS)
-    run = checks(None, [])
+    run = checks(None, [], PASS)
     for _ in range(2):
         assert run.results(task, label="t", tracked=None, compute=compute) == ((PASS,), False)
     run.close()
@@ -629,7 +647,7 @@ def test_uncacheable_and_unreadable_tasks_run_with_a_note(
     notes: list[str] = []
     (task / "link").symlink_to(tmp_path)
     compute = Recorder(PASS)
-    run = checks(store, notes)
+    run = checks(store, notes, PASS)
     assert run.results(task, label="tasks/echo", tracked=None, compute=compute)[1] is False
     (task / "link").unlink()
 
@@ -653,7 +671,7 @@ def test_a_cache_that_cannot_be_written_is_turned_off_for_the_run(
     blocker.write_text("x", encoding="utf-8")
     notes: list[str] = []
     compute = Recorder(PASS)
-    run = checks(ResultCache(blocker / "cache"), notes)
+    run = checks(ResultCache(blocker / "cache"), notes, PASS)
     assert run.results(task, label="t", tracked=None, compute=compute) == ((PASS,), False)
     assert run.cache is None
     assert run.results(task, label="t", tracked=None, compute=compute) == ((PASS,), False)
@@ -676,9 +694,375 @@ def test_counts_that_cannot_be_recorded_are_noted(task: Path, held_lock: Path) -
 def test_a_copied_task_hits_only_under_its_own_label(task: Path, tmp_path: Path) -> None:
     store = ResultCache(tmp_path / "cache")
     compute = Recorder(PASS)
-    checks(store, []).results(task, label="tasks/echo", tracked=None, compute=compute)
+    checks(store, [], PASS).results(task, label="tasks/echo", tracked=None, compute=compute)
     copy = tmp_path / "elsewhere" / "echo"
     shutil.copytree(task, copy)
-    found = checks(store, []).results(copy, label="tasks/echo", tracked=None, compute=compute)
+    found = checks(store, [], PASS).results(copy, label="tasks/echo", tracked=None, compute=compute)
     assert found == ((PASS,), True)
     assert compute.calls == 1
+
+
+# --- what a replayed entry must satisfy, and what a cache must not be ------------------
+
+
+def test_an_entry_is_replayed_only_with_exactly_the_enabled_gates(tmp_path: Path) -> None:
+    """A forged or stale entry that reports fewer, more or other gates is a miss: a
+    replay can never show zero gates as a pass."""
+    store = ResultCache(tmp_path / "cache")
+    store.store("k", task="t", runner="local", results=(PASS, WARN))
+    store.store("empty", task="t", runner="local", results=())
+    assert store.lookup("k") == (PASS, WARN)
+    assert store.lookup("k", codes=["TG101", "TG104"]) == (PASS, WARN)
+    assert store.lookup("k", codes=["TG104", "TG101"]) is None
+    assert store.lookup("k", codes=["TG101"]) is None
+    assert store.lookup("k", codes=["TG101", "TG104", "TG401"]) is None
+    assert store.lookup("empty") == ()
+    assert store.lookup("empty", codes=["TG101"]) is None
+    assert store.lookup("empty", codes=[]) == ()
+
+
+def test_expected_codes_leave_out_disabled_gates(tmp_path: Path) -> None:
+    run = CachedChecks(None, BUILTIN_GATES, Config(disabled=frozenset({"TG104"})), LocalRunner())
+    assert "TG104" not in run.expected_codes
+    assert run.expected_codes == [g.code for g in BUILTIN_GATES if g.code != "TG104"]
+    assert run.checked == tuple(BUILTIN_GATES)
+
+
+def test_committed_paths_names_what_git_tracks_at_the_cache(repo: GitRepo) -> None:
+    repo.write("README.md", "# Tasks\n")
+    repo.commit("base")
+    cache = repo.root / ".taskgate" / "cache"
+    assert cache_module.committed_paths(cache) == []  # not there at all
+    cache.mkdir(parents=True)
+    assert cache_module.committed_paths(cache) == []  # untracked
+    repo.write(".taskgate/cache/entries/" + "a" * 64 + ".json", "{}")
+    repo.write(".taskgate/cache/CACHEDIR.TAG", "Signature: 8a477f597d28d172789f06886806bc55\n")
+    repo.git("add", "-f", ".taskgate")
+    repo.commit("forged")
+    assert cache_module.committed_paths(cache) == [
+        ".taskgate/cache/CACHEDIR.TAG",
+        ".taskgate/cache/entries/" + "a" * 64 + ".json",
+    ]
+    assert cache_module.committed_paths(cache / "entries") == [
+        ".taskgate/cache/entries/" + "a" * 64 + ".json"
+    ]
+    assert cache_module.committed_paths(repo.root / "elsewhere") == []
+
+
+def test_a_committed_symlink_standing_for_the_cache_counts_as_tracked(repo: GitRepo) -> None:
+    """A pull request can commit ``.taskgate/cache`` as a symlink to a directory of
+    entries it also commits (or to one outside the checkout)."""
+    repo.write("README.md", "# Tasks\n")
+    repo.write("fixtures/" + "b" * 64 + ".json", "{}")
+    (repo.root / ".taskgate").mkdir()
+    (repo.root / ".taskgate" / "cache").symlink_to(Path("..") / "fixtures")
+    repo.git("add", "-f", ".taskgate", "fixtures")
+    repo.commit("link")
+    found = cache_module.committed_paths(repo.root / ".taskgate" / "cache")
+    assert ".taskgate/cache" in found
+    assert "fixtures/" + "b" * 64 + ".json" in found
+
+
+def test_committed_paths_is_empty_outside_a_repository_or_without_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plain = tmp_path / "plain" / "cache"
+    plain.mkdir(parents=True)
+    assert cache_module.committed_paths(plain) == []
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+    assert cache_module.committed_paths(plain) == []
+
+
+def test_a_cache_the_repository_tracks_is_not_used(task: Path, repo: GitRepo) -> None:
+    """The trust model: a pull request must not be able to supply its own passes."""
+    repo.write("README.md", "# Tasks\n")
+    repo.write(".taskgate/cache/entries/" + "c" * 64 + ".json", "{}")
+    repo.git("add", "-f", ".taskgate")
+    repo.commit("with a cache")
+    notes: list[str] = []
+    compute = Recorder(PASS)
+    run = CachedChecks(
+        ResultCache(repo.root / ".taskgate" / "cache"),
+        gates_of(PASS),
+        Config(),
+        LocalRunner(),
+        note=notes.append,
+    )
+    assert run.cache is None
+    assert run.results(task, label="t", tracked=None, compute=compute) == ((PASS,), False)
+    run.close()
+    assert notes == [
+        f"result cache off for this run: {repo.root / '.taskgate' / 'cache'} is tracked by the "
+        "repository (1 committed path, e.g. .taskgate/cache/entries/" + "c" * 64 + ".json); "
+        "a cache that a pull request can commit is not trusted"
+    ]
+
+
+# --- plugin edits invalidate their results ----------------------------------------------
+
+
+PLUGIN_GATE = """
+from taskgate.gates import Check, gate
+from taskgate.results import Severity
+
+import tgtest_patterns
+from tgtest_helper import scan
+
+
+@gate("TG702", "no-banned-phrase", severity=Severity.ERROR, summary="no banned phrase",
+      fix_hint="Reword it.")
+def no_banned_phrase(ctx):
+    return scan(ctx, tgtest_patterns.BANNED)
+"""
+
+PLUGIN_RULES = """
+from tgtest_base import WordGate
+
+RULE = WordGate("TG703", "no-word", word={word!r})
+"""
+
+PLUGIN_BASE = """
+from dataclasses import dataclass
+
+from taskgate.gates import Check
+from taskgate.results import Severity
+
+
+@dataclass(frozen=True)
+class WordGate:
+    code: str
+    name: str
+    word: str
+    severity: Severity = Severity.ERROR
+    summary: str = "no word"
+    fix_hint: str = "Reword it."
+    requires: tuple[str, ...] = ()
+
+    def check(self, ctx):
+        return Check.ok("fine")
+"""
+
+
+def write_plugin(
+    where: Path, *, banned: str, word: str, helper: str = "return Check.ok('x')"
+) -> None:
+    (where / "tgtest_patterns.py").write_text(f"BANNED = {banned!r}\n", encoding="utf-8")
+    (where / "tgtest_helper.py").write_text(
+        f"from taskgate.gates import Check\n\n\ndef scan(ctx, banned):\n    {helper}\n",
+        encoding="utf-8",
+    )
+    (where / "tgtest_gate.py").write_text(PLUGIN_GATE, encoding="utf-8")
+    (where / "tgtest_base.py").write_text(PLUGIN_BASE, encoding="utf-8")
+    (where / "tgtest_rules.py").write_text(PLUGIN_RULES.format(word=word), encoding="utf-8")
+
+
+def plugin_key(where: Path, *, version: str = "0.1") -> str:
+    """The cache key with the plugin at ``where`` freshly imported."""
+    import importlib
+    import sys
+
+    for name in [n for n in sys.modules if n.startswith("tgtest_")]:
+        del sys.modules[name]
+    importlib.invalidate_caches()
+    cache_module._source_digest.cache_clear()  # one process, several plugin versions
+    sys.path.insert(0, str(where))
+    try:
+        gate_module = importlib.import_module("tgtest_gate")
+        rules = importlib.import_module("tgtest_rules")
+    finally:
+        sys.path.remove(str(where))
+    entries = [
+        Registered(
+            gate_module.no_banned_phrase,
+            "plugin fg",
+            PluginSource("tgtest_gate:no_banned_phrase", f"fg {version}"),
+        ),
+        Registered(rules.RULE, "plugin wg", PluginSource("tgtest_rules:RULE", f"wg {version}")),
+    ]
+    return cache_key(
+        "content",
+        label="tasks/echo",
+        name="echo",
+        gates=[*BUILTIN_GATES, *entries],
+        config=Config(),
+        runner=LocalRunner(),
+    )
+
+
+def test_editing_a_plugin_or_its_helpers_or_parameters_changes_the_key(tmp_path: Path) -> None:
+    """A tightened rule must not replay the verdict of the old one: the key covers the
+    plugin's helper modules, the constants and parameters it reads, its entry-point
+    module and its distribution version."""
+    where = tmp_path / "plugin"
+    where.mkdir()
+    write_plugin(where, banned="zzz", word="zzz")
+    base = plugin_key(where)
+    assert plugin_key(where) == base  # a re-import alone changes nothing
+    variants: list[str] = []
+    write_plugin(where, banned="Copy", word="zzz")  # a constant in an imported module
+    variants.append(plugin_key(where))
+    write_plugin(where, banned="zzz", word="Copy")  # a parameter set in the entry-point module
+    variants.append(plugin_key(where))
+    write_plugin(where, banned="zzz", word="zzz", helper="return Check.fail('banned')")
+    variants.append(plugin_key(where))  # the imported helper function's module
+    write_plugin(where, banned="zzz", word="zzz")
+    variants.append(plugin_key(where, version="0.2"))  # the distribution's version
+    assert len({base, *variants}) == len(variants) + 1
+    assert plugin_key(where) == base
+
+
+def test_gate_material_covers_every_kind_of_value(tmp_path: Path) -> None:
+    import re
+    import sys
+
+    plain = cache_module._plain
+    assert plain({"b": 1, "a": (2, 3.5, None, True)}) == {"a": [2, 3.5, None, True], "b": 1}
+    assert plain(Severity.ERROR) == "error"
+    pattern = re.compile("x", re.I)
+    assert plain(pattern) == {"pattern": "x", "flags": pattern.flags}
+    assert plain(Path("/a")) == "/a"
+    assert plain(b"raw") == hashlib.sha256(b"raw").hexdigest()
+    assert plain(sys) == "module sys"
+    assert plain(Path) == "pathlib._local:Path" or plain(Path) == "pathlib:Path"
+    assert plain(frozenset({2, 1})) == ["1", "2"]
+    assert plain(threading.Lock()).startswith("_thread:")
+    nested: list[object] = []
+    for _ in range(10):
+        nested = [nested]
+    assert "list" in json.dumps(plain(nested))
+    assert cache_module._is_data({"k": [1, "x", re.compile("y")]})
+    assert not cache_module._is_data({1: "not a string key"})
+    assert not cache_module._is_data([sys])
+    assert cache_module._module_material("tgtest_not_imported") == {
+        "source": None,
+        "constants": {},
+        "imports": {},
+    }
+
+    class Slotted:
+        __slots__ = ("code", "name")
+
+        def __init__(self) -> None:
+            self.code = "TG799"
+            self.name = "slotted"
+
+    assert cache_module._state(Slotted()) == {"code": "TG799", "name": "slotted"}  # type: ignore[arg-type]
+    assert cache_module._gate_origin(no_todo)["state"]["code"] == "TG701"
+
+
+def test_gate_state_reads_enums_and_plain_objects() -> None:
+    import enum
+
+    class Level(enum.Enum):
+        LOW = 1
+
+    class Params:
+        def __init__(self) -> None:
+            self.code = "TG798"
+            self.level = Level.LOW
+            self.limit = 3
+
+    assert cache_module._plain(Level.LOW) == 1
+    assert cache_module._state(Params()) == {"code": "TG798", "level": 1, "limit": 3}  # type: ignore[arg-type]
+    assert cache_module._is_data(Level.LOW)
+    assert cache_module._is_data(Path("patterns.txt"))
+
+
+# --- stats and prune touch only what TaskGate wrote -----------------------------------
+
+
+def test_entries_are_key_named_regular_files_only(tmp_path: Path) -> None:
+    store = ResultCache(tmp_path / "cache")
+    real = hexkey("real")
+    store.store(real, task="t", runner="local", results=(PASS,))
+    odd_dir = store.entries_dir / f"{hexkey('dir')}.json"
+    odd_dir.mkdir()
+    dangling = store.entries_dir / f"{hexkey('dangling')}.json"
+    dangling.symlink_to(tmp_path / "missing")
+    leftover_dir = store.entries_dir / f"{cache_module.TMP_PREFIX}dir"
+    leftover_dir.mkdir()
+    assert [entry.path.name for entry in store.entries()] == [f"{real}.json"]
+    assert store.prune(everything=True).count == 1
+    assert odd_dir.is_dir()
+    assert dangling.is_symlink()
+    assert leftover_dir.is_dir()
+
+
+def test_prune_refuses_a_directory_taskgate_did_not_tag(tmp_path: Path) -> None:
+    """A wrong ``--cache-dir`` must never delete files: without TaskGate's
+    CACHEDIR.TAG nothing is listed and prune is an error, even as a dry run."""
+    other = tmp_path / "project"
+    (other / "entries").mkdir(parents=True)
+    victim = other / "entries" / f"{hexkey('x')}.json"
+    victim.write_text("{}", encoding="utf-8")
+    store = ResultCache(other)
+    assert store.entries() == ()
+    for dry_run in (False, True):
+        with pytest.raises(CacheError, match="not a taskgate cache"):
+            store.prune(dry_run=dry_run)
+    assert victim.read_text(encoding="utf-8") == "{}"
+    assert not (other / LOCK_FILE).exists()
+
+
+def test_a_symlinked_entries_directory_is_left_alone(tmp_path: Path) -> None:
+    store = ResultCache(tmp_path / "cache")
+    store.store(hexkey("a"), task="t", runner="local", results=(PASS,))
+    elsewhere = tmp_path / "elsewhere"
+    store.entries_dir.rename(elsewhere)
+    store.entries_dir.symlink_to(elsewhere)
+    assert store.entries() == ()
+    assert store.prune(everything=True).count == 0
+    assert (elsewhere / f"{hexkey('a')}.json").is_file()
+
+
+def test_a_dry_run_writes_nothing(tmp_path: Path) -> None:
+    store = ResultCache(tmp_path / "cache")
+    store.store(hexkey("a"), task="t", runner="local", results=(PASS,))
+    (store.directory / LOCK_FILE).unlink()
+    assert store.prune(everything=True, dry_run=True).count == 1
+    assert not (store.directory / LOCK_FILE).exists()
+    assert store.entry_path(hexkey("a")).is_file()
+
+
+def test_an_older_entry_listed_first_is_superseded(tmp_path: Path) -> None:
+    store = ResultCache(tmp_path / "cache")
+    first, second = sorted([hexkey("p"), hexkey("q")])
+    now = time.time()
+    for key, when in ((first, now - 100), (second, now)):
+        store.store(key, task="tasks/a", runner="local", results=(PASS,))
+        os.utime(store.entry_path(key), (when, when))
+    pruned = store.prune(now=now, dry_run=True)
+    assert [entry.path.stem for entry in pruned.removed["superseded"]] == [first]
+    assert [entry.path.stem for entry in pruned.kept] == [second]
+
+
+# --- committed_paths edge cases ---------------------------------------------------------
+
+
+def test_committed_paths_through_a_symlinked_path_to_the_repository(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    """The cache path may reach the work tree through a symlink (``/var`` versus
+    ``/private/var`` on macOS); the tracked entries are still found."""
+    repo.write("README.md", "# Tasks\n")
+    repo.write(".taskgate/cache/entries/" + "d" * 64 + ".json", "{}")
+    repo.git("add", "-f", ".taskgate")
+    repo.commit("with a cache")
+    alias = tmp_path / "alias"
+    alias.symlink_to(repo.root)
+    assert cache_module.committed_paths(alias / ".taskgate" / "cache") == [
+        ".taskgate/cache/entries/" + "d" * 64 + ".json"
+    ]
+
+
+def test_committed_paths_of_the_work_tree_root_or_a_failed_listing_is_empty(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("README.md", "# Tasks\n")
+    repo.commit("base")
+    assert cache_module.committed_paths(repo.root) == []
+    real = cache_module._git_stdout
+    monkeypatch.setattr(
+        cache_module, "_git_stdout", lambda *args: None if "ls-files" in args else real(*args)
+    )
+    assert cache_module.committed_paths(repo.root / "README.md") == []

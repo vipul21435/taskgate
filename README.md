@@ -73,10 +73,17 @@ answer should be) is the most common way a task goes wrong.
   bit, symlink targets; never mtimes or walk order; tool caches such as
   `__pycache__/`, `*.pyc`, `.DS_Store` and `.taskgate/` left out; in diff mode
   also git's list of the task's tracked files), the TaskGate build (version plus
-  a digest of its own source), the gates, the effective `taskgate.toml`, the
-  runner and the task's path. A hit replays the stored results and the report
-  marks the task `(cached)`. Only results without a blocking failure are stored,
-  so a failing task is always checked again. Entries live in `.taskgate/cache`
+  a digest of its own source), the gates (for a plugin gate also its entry
+  point, its distribution's version, the gate object's parameters and the
+  source and constants of its module and of what that module imports), the
+  effective `taskgate.toml`, the runner and the task's path. A hit replays the
+  stored results only when they carry exactly the enabled gates' codes, and
+  the report marks the task `(cached)`. Only results without a blocking
+  failure are stored, so a failing task is always checked again. A cache
+  directory that the checked repository tracks in git is not used (a pull
+  request could commit entries), and `taskgate cache stats` and `prune` act
+  only on a directory holding TaskGate's `CACHEDIR.TAG` and only on key-named
+  entry files, so a wrong `--cache-dir` deletes nothing. Entries live in `.taskgate/cache`
   under the repository root (or the `--all` directory), one JSON file per key,
   written atomically (temp file, `fsync`, `os.replace`) under an `flock` on
   `.taskgate/cache/lock`; the directory carries a `.gitignore` of `*`, so
@@ -829,6 +836,15 @@ flowchart LR
   the task directory other than the config is hashed.
 - The key includes the host's Python, pytest and platform even on the Docker
   runner, so upgrading TaskGate's own environment misses every entry once.
+- For a plugin gate the key follows imports one hop from the gate's module and
+  its entry-point module: editing a module that a plugin's helper imports (two
+  hops away) does not invalidate cached results. Bumping the plugin's version
+  or `--no-cache` does.
+- Cache entries are not signed. The cache refuses a directory the checked
+  repository tracks, but anyone who can write the cache directory on the
+  machine that runs TaskGate (for example a restored CI cache from an
+  untrusted job) can plant a replayed pass; keep the cache per trusted
+  workflow or use `--no-cache` there.
 - Cache entries accumulate until `taskgate cache prune` runs; nothing prunes them
   automatically.
 - In the TaskGate image the application directory is not writable by its user,
