@@ -489,7 +489,7 @@ def test_prune_keeps_the_latest_entry_per_task_and_runner(tmp_path: Path) -> Non
     (store.entries_dir / ".tmp-leftover").write_text("half", encoding="utf-8")
 
     stats = store.stats()
-    assert (len(stats.entries), stats.current, stats.tasks) == (7, 5, 3)
+    assert (len(stats.entries), stats.current, stats.tasks) == (7, 5, 2)
     assert stats.runners == {"docker": 1, "local": 4}
 
     preview = store.prune(now=now, dry_run=True)

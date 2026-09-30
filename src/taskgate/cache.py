@@ -368,7 +368,8 @@ class CacheStats:
 
     @property
     def tasks(self) -> int:
-        return len({(e.task, e.runner) for e in self.entries if e.current})
+        """Distinct tasks with a usable entry (a task cached on two runners counts once)."""
+        return len({entry.task for entry in self.entries if entry.current})
 
     @property
     def runners(self) -> dict[str, int]:

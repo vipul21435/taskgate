@@ -154,6 +154,12 @@ def test_the_runner_and_config_are_part_of_the_key(tmp_path: Path, fake_docker: 
     assert "docker runner\n" in docker.stdout
     assert "cached" not in docker.stdout
     assert "(cached)" in check("--all", str(root), "--runner", "docker").stdout
+    stats = json.loads(runner.invoke(app, ["cache", "stats", "--json"]).stdout)
+    assert (stats["entries"], stats["tasks"], stats["runners"]) == (
+        2,
+        1,
+        {"docker": 1, "local": 1},
+    )
     (root / "taskgate.toml").write_text('[gates]\ndisable = ["TG104"]\n', encoding="utf-8")
     assert "cached" not in check("--all", str(root)).stdout
     assert "(cached)" in check("--all", str(root)).stdout
