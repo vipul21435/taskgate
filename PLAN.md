@@ -267,6 +267,32 @@ passes the same review gates before it is accepted.
     code. The tests point `TASKGATE_CACHE_DIR` at each test's temp directory so
     no test writes into the source tree.
 
+- **Review fixes, TG501 restore and JUnit cap (2026-09-30):**
+  - The Docker driver's tar snapshot failed on a root-owned `mkdir -m 777`
+    workdir (tar could not reset `.`'s times and mode) and lost mode bits and
+    sub-second mtimes (no `-p`, gnu format); the local runner's `copytree` split
+    hard links, could not copy named pipes or `chmod 000` files, and put absolute
+    temp paths into messages. Both runners now use one stdlib module,
+    `snapshot.py` (Python 3.8+, copied into the container as
+    `taskgate_snapshot.py`, the local runner imports it). It records every entry
+    with its inode and change time and copies file contents once per inode;
+    restore recreates only entries whose inode or ctime moved (ctime cannot be set
+    by hand, so an unchanged ctime proves an untouched inode) and never replaces
+    the workdir itself. Untouched entries keep their inode and owner, which is
+    closer to rerun 1 than any copy. Metadata a non-owner cannot set is skipped
+    only for entries the run user does not own; errors name workspace-relative
+    paths. A directory the run user can neither list nor `chmod` is a save error
+    (known issue), since its content could not be checked.
+  - `snapshot.py` uses `os` functions, with a per-file ruff `PTH` exemption,
+    because `Path.readlink` and `Path.hardlink_to` do not exist on Python 3.8.
+  - The 8 MiB JUnit cap now holds on Docker too: the driver prints the file only
+    when `wc -c` says it fits, else marks `junit-over-limit`, and both runners
+    carry `GraderRun.junit_problem`, so TG501's detail says "JUnit XML over the
+    8 MiB limit (not read)" instead of "no JUnit XML". The message never states
+    the size, since JUnit durations make it vary between runs.
+  - `taskgate grade` checks for `solution/solve.sh` and `tests/` and exits 2
+    (usage error) instead of a traceback.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license

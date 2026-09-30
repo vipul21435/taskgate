@@ -30,7 +30,16 @@ from taskgate.engine import run_gates
 from taskgate.gates import BUILTIN_GATES, TaskContext
 from taskgate.gates.determinism import grader_deterministic
 from taskgate.results import GateResult, Severity, Status
-from taskgate.runner import BuildResult, GraderRun, Regrade, Runner, RunResult, Solution
+from taskgate.runner import (
+    JUNIT_OVER_LIMIT,
+    MAX_JUNIT_BYTES,
+    BuildResult,
+    GraderRun,
+    Regrade,
+    Runner,
+    RunResult,
+    Solution,
+)
 
 GATES = tuple(g for g in BUILTIN_GATES if g.code in ("TG101", "TG401", "TG501"))
 cli = CliRunner()
@@ -133,6 +142,52 @@ def test_grade_rejects_a_directory_without_a_manifest(tmp_path: Path) -> None:
     assert "is not a task directory (no task.toml)" in result.output
     negative = cli.invoke(app, ["grade", str(tmp_path), "--seed", "-1"])
     assert negative.exit_code == 2
+
+
+def test_grade_rejects_a_task_without_tests_or_a_solution(tmp_path: Path) -> None:
+    partial = tmp_path / "t" / "partial"
+    partial.mkdir(parents=True)
+    (partial / "task.toml").write_text('[task]\nid = "partial"\n', encoding="utf-8")
+    result = cli.invoke(app, ["grade", partial.as_posix(), "--seed", "1", "--runner", "local"])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert result.stderr == (
+        f"error: {partial.as_posix()} cannot be graded: missing solution/solve.sh, tests/ "
+        "(see TG101)\n"
+    )
+    (partial / "tests").mkdir()
+    (partial / "solution").mkdir()
+    result = cli.invoke(app, ["grade", partial.as_posix(), "--seed", "1", "--runner", "local"])
+    assert result.exit_code == 2
+    assert "missing solution/solve.sh (see TG101)" in result.stderr
+
+
+def test_grade_names_junit_over_the_limit(tmp_path: Path) -> None:
+    grader = (
+        "def test_big(record_property) -> None:\n"
+        f"    record_property('output', 'x' * ({MAX_JUNIT_BYTES} + 1))\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    result = cli.invoke(app, ["grade", str(task), "--seed", "1", "--runner", "local"])
+    assert result.exit_code == 0
+    assert result.stdout.splitlines()[-2:] == [
+        "(JUnit XML over the 8 MiB limit (not read))",
+        "result: PASS",
+    ]
+
+
+def test_the_gate_gives_the_same_verdict_on_junit_over_the_limit(tmp_path: Path) -> None:
+    grader = (
+        "def test_big(record_property) -> None:\n"
+        f"    record_property('output', 'x' * ({MAX_JUNIT_BYTES} + 1))\n"
+    )
+    config = Config(determinism=DeterminismOptions(runs=2))
+    result = tg501(make_task(tmp_path / "echo", grader=grader), config)
+    assert result.status is Status.FAIL
+    assert result.details[0] == (
+        "run 1 (seed 1): pytest exited 0 with JUnit XML over the 8 MiB limit (not read); "
+        "reproduce: taskgate grade tasks/x --seed 1 --runner local"
+    )
 
 
 def test_grade_reports_a_failing_solution(tmp_path: Path) -> None:
@@ -257,6 +312,17 @@ def test_many_flipped_tests_are_capped_in_the_message(tmp_path: Path) -> None:
         "1 of 2 reruns failed; 5 tests flipped: t::test_0, t::test_1, t::test_2 and 2 more"
     )
     assert len(result.details) == 5
+
+
+def test_junit_over_the_limit_is_named_in_the_details(tmp_path: Path) -> None:
+    big = GraderRun(2, 0, "", "1 passed", JUNIT_OVER_LIMIT)
+    runner = canned(run_ok(1), big, run_ok(3), run_ok(4), run_ok(5))
+    result = tg501(make_task(tmp_path / "echo"), runner=runner)
+    assert result.message == "run 2 (seed 2) left no readable JUnit XML"
+    assert result.details == (
+        "run 2 (seed 2): pytest exited 0 with JUnit XML over the 8 MiB limit (not read); "
+        "reproduce: taskgate grade tasks/x --seed 2 --runner canned",
+    )
 
 
 def test_a_runner_error_between_reruns_fails_the_gate(tmp_path: Path) -> None:

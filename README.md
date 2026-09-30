@@ -50,8 +50,10 @@ answer should be) is the most common way a task goes wrong.
   Only `error` failures block. The full task layout, runtime contract and gate
   rules are in [docs/task-layout.md](docs/task-layout.md).
 - **Grader determinism (TG501).** The reference solution runs once more, then
-  the grader runs 5 times on identical copies of its output (the workspace is
-  restored before each rerun). Rerun `i` uses seed `i` (`[determinism] seed`
+  the grader runs 5 times on that same output: before each rerun after the
+  first, `snapshot.py` puts back whatever the previous rerun changed, so every
+  rerun sees the workspace exactly as `solve.sh` left it (modes, sub-second
+  mtimes, hard links and named pipes included). Rerun `i` uses seed `i` (`[determinism] seed`
   moves the start) three ways: a pytest plugin TaskGate bundles
   (`shuffle_plugin.py`, loaded as `-p taskgate_shuffle --taskgate-seed i`)
   shuffles the collected tests with `random.Random(i)` and seeds `random`;
@@ -503,6 +505,7 @@ flowchart LR
 | `runner.py` | the `Runner` protocol (`build`, `run` with a reference, no or stub solution, `regrade` with seeds), `RunResult`, `Regrade`, the local subprocess runner |
 | `docker_runner.py` | the Docker runner (content-derived tags, locked-down `docker run`, in-container driver with a regrade mode), `docker_status` and the auto/docker/local choice |
 | `shuffle_plugin.py` | the pytest plugin copied into every TG501 rerun: seeded test order and a seeded `random` |
+| `snapshot.py` | records the solved workspace and puts back only what a rerun changed; imported by the local runner, run as a script in the container (Python 3.8+, stdlib only) |
 | `determinism.py` | JUnit XML to pytest test ids and outcomes, flipped tests and how to describe them |
 | `dockerfile.py` | Dockerfile parsing, the static checks behind TG301, the pulled-image list behind TG302 |
 | `files.py` | which task paths are content (caches, `.DS_Store` and `.taskgate/` are not) and a sorted walk |
@@ -591,9 +594,16 @@ flowchart LR
   network, a non-root uid, `memory.max` and `pids.max`.
 - **Determinism is checked against identical inputs.** TG501 grades one
   solution output five times rather than rerunning the solution, so a flip is
-  the grader's alone, and every rerun starts from a fresh copy of that output
-  (the Docker driver keeps a tar of the workdir in its tmpfs), so a grader that
-  writes into the workspace cannot change a later rerun. A rerun is fully
+  the grader's alone. Every rerun sees that output exactly: `snapshot.py`
+  records each entry (type, mode, nanosecond times, inode and change time, hard
+  links) and copies file contents into a store outside the workspace (the
+  Docker driver keeps it in its tmpfs), and before each later rerun it recreates
+  only the entries whose inode or change time moved. An untouched entry keeps
+  its inode and owner, so a grader that writes into the workspace cannot change
+  a later rerun, and one that does not write sees the very same files. Both
+  runners use the same module (the Docker runner copies it into the container),
+  so they agree on hard links, named pipes, unreadable files and mode bits,
+  and a workdir the run user may write but does not own (`mkdir -m 777`) works. A rerun is fully
   determined by its seed: the plugin shuffles with `random.Random(seed)` and
   seeds `random` before collection, which is why `taskgate grade --seed S`
   reproduces it, and why the demo's flips are the same on macOS, in the image
@@ -636,8 +646,9 @@ flowchart LR
 - On both runners the tests are present (in a separate directory) while
   `solve.sh` runs, so a reference solution could read them; the grader is not
   hidden from the solution.
-- The Docker runner needs the image to provide `sh`, `tar`, `find` and
-  `python` (or `python3`) with pytest, and a workdir the image's user can write;
+- The Docker runner needs the image to provide `sh`, `tar`, `find`, `wc` and
+  `python` (or `python3`, 3.8 or later) with pytest, and a workdir the image's
+  user can write;
   the samples do this in five lines, and a missing piece shows up as a TG401
   failure with the container's output.
 - TG301's static checks cannot see a `USER` inherited from the base image, so a
@@ -679,13 +690,17 @@ flowchart LR
   are set up more often than in file order; a grader that is only correct under
   its file's fixture order is reported as flaky, which is the point, but the
   first failure can be a setup error rather than an assertion.
-- JUnit XML over 8 MiB is not read; such a rerun is reported as leaving no
-  readable JUnit XML.
-- On the Docker runner the workdir is restored between reruns by deleting its
-  contents and unpacking the saved tar as the run user, so the image must
-  provide `find -mindepth -delete`, and files the image made read-only to that
-  user cannot be restored (the gate then fails with "could not restore the
-  workspace").
+- JUnit XML over 8 MiB is not read on either runner; such a rerun is reported
+  as leaving no readable JUnit XML, with "JUnit XML over the 8 MiB limit (not
+  read)" in its detail.
+- The rerun restore works as the run user. An entry a rerun changed that belongs
+  to another user (a file the Dockerfile copied in without `--chown` and left
+  writable) comes back owned by the run user; the workdir's own mtime is not
+  reset when the run user does not own it; a file the run user can neither read
+  nor `chmod` fails TG501 only if a rerun changes it; a directory it can neither
+  list nor `chmod` stops TG501 before the reruns ("could not save the solved
+  workspace"); and a socket or device file a rerun removed cannot be recreated.
+  Inode numbers and change times of recreated entries differ from rerun 1's.
 - `taskgate grade` takes the task path as reports print it, relative to the
   repository root in diff mode, so it must be run from that directory.
 - The high-entropy detector trades recall for precision: it misses about 11% of

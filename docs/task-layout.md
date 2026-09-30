@@ -64,8 +64,12 @@ times (default 5) on identical copies of its output. Rerun `i` uses seed
 
 Each rerun writes pytest's JUnit XML (`-o junit_family=xunit1`, which keeps each
 test's file), and TaskGate compares the exit code and every test's outcome
-(passed, failed, error, skipped) across the reruns. Before each rerun after the
-first, the workspace is restored to the state `solve.sh` left, so a grader that
+(passed, failed, error, skipped) across the reruns. JUnit XML over 8 MiB is not
+read on either runner, and the rerun is reported as having no readable outcomes.
+Before each rerun after the first, the workspace is put back to the state
+`solve.sh` left (`src/taskgate/snapshot.py`): entries whose inode or change time
+moved are recreated with their recorded type, content, mode bits, nanosecond
+times and hard links, and untouched entries are left alone. So a grader that
 writes into the workspace cannot change a later rerun. The solution and all the
 reruns share a budget of `(runs + 1) x timeout_sec`.
 
@@ -99,10 +103,12 @@ image with:
 - the workdir from `environment.workdir`, as the image provides it.
 
 For TG501 the driver runs the reruns in the same container: after `solve.sh`
-it saves the workdir as a tar in the tmpfs, and before each later rerun it
-deletes the workdir's contents and unpacks the tar again, so the image must also
-provide `find` with `-mindepth` and `-delete`. The shuffle plugin travels in the
-same tar on stdin as the solution and tests.
+it runs `python taskgate_snapshot.py save . /taskgate/solved`, and before each
+later rerun `... restore`, the same module the local runner imports, so the
+image's Python must be 3.8 or later. A rerun's JUnit XML is printed back only
+when it is at most 8 MiB (`wc -c`). The shuffle plugin and the snapshot module
+travel in the same tar on stdin as the solution and tests. The workdir itself is
+never replaced, so it may belong to root as long as the run user can write it.
 
 When the budget runs out the container is killed (`docker kill`) and removed.
 The limits come from `[runner]` in `taskgate.toml` (`cpus`, `memory_mb`,

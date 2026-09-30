@@ -9,7 +9,9 @@ one :data:`Solution` followed by the grader. There are three kinds of solution:
   solution created, empty, and does nothing else (TG403).
 
 ``regrade`` runs the reference solution once and then the grader once per seed
-on an identical copy of its output (TG501). Each rerun loads the bundled
+on that same output (TG501): :mod:`taskgate.snapshot` records the solved
+workspace and, before every rerun after the first, puts back whatever the
+previous rerun changed. Each rerun loads the bundled
 :mod:`taskgate.shuffle_plugin` to shuffle the test order with the seed, sets
 ``PYTHONHASHSEED`` and ``TASKGATE_SEED`` to the seed, and writes pytest's JUnit
 XML, so per-test outcomes can be compared across reruns.
@@ -39,7 +41,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Literal, Protocol
 
-from taskgate import shuffle_plugin
+from taskgate import shuffle_plugin, snapshot
 from taskgate.files import ignore_caches, regular_files
 
 OUTPUT_TAIL_LINES = 20
@@ -49,10 +51,16 @@ PYTEST_ARGS: tuple[str, ...] = ("-m", "pytest", "-q", "-p", "no:cacheprovider")
 SOLUTION_ENTRY = "solve.sh"
 PLUGIN_MODULE = "taskgate_shuffle"
 """The name :mod:`taskgate.shuffle_plugin` is copied under for a rerun (``-p`` loads it)."""
+SNAPSHOT_MODULE = "taskgate_snapshot"
+"""The name :mod:`taskgate.snapshot` is copied under into a Docker regrade."""
 PLUGIN_DIR = "plugin"
+SNAPSHOT_DIR = "solved"
+"""Where a regrade keeps the solved workspace's snapshot, next to the workspace."""
 JUNIT_FILE = "junit.xml"
 MAX_JUNIT_BYTES = 8 << 20
 """JUnit XML beyond this size is not read (a rerun with it reports no outcomes)."""
+JUNIT_OVER_LIMIT = f"JUnit XML over the {MAX_JUNIT_BYTES >> 20} MiB limit (not read)"
+"""Why a rerun's outcomes are missing when its JUnit XML was too big, on either runner."""
 _DURATION = re.compile(r"\s+in\s+\d+(?:\.\d+)?s\b.*$")
 
 
@@ -147,6 +155,9 @@ class GraderRun:
     output: str
     """pytest's combined stdout and stderr, in full."""
 
+    junit_problem: str | None = None
+    """Why :attr:`junit` is empty although pytest wrote a file (:data:`JUNIT_OVER_LIMIT`)."""
+
 
 @dataclass(frozen=True, slots=True)
 class Regrade:
@@ -175,8 +186,9 @@ class Runner(Protocol):
     def run(self, task_dir: Path, *, solution: Solution, timeout_sec: float) -> RunResult: ...
 
     def regrade(self, task_dir: Path, *, seeds: Sequence[int], timeout_sec: float) -> Regrade:
-        """Run the reference solution, then the grader once per seed on a fresh copy of
-        its output; the whole call has ``(len(seeds) + 1) * timeout_sec`` seconds."""
+        """Run the reference solution, then the grader once per seed on its output, put
+        back as it was before each rerun; the whole call has ``(len(seeds) + 1) *
+        timeout_sec`` seconds."""
         ...
 
 
@@ -287,14 +299,23 @@ def seeded_env(env: dict[str, str], seed: int, plugin_dir: Path) -> dict[str, st
     return {**env, "PYTHONHASHSEED": str(seed), "TASKGATE_SEED": str(seed), "PYTHONPATH": path}
 
 
-def read_junit(path: Path) -> str:
-    """The JUnit XML at ``path``; ``""`` when it is missing or larger than the cap."""
+def read_junit(path: Path) -> tuple[str, str | None]:
+    """The JUnit XML at ``path`` and why it is empty when the file was too big to read.
+
+    A missing file gives ``("", None)``; a file over :data:`MAX_JUNIT_BYTES` gives
+    ``("", JUNIT_OVER_LIMIT)``.
+    """
     try:
         if path.stat().st_size > MAX_JUNIT_BYTES:
-            return ""
-        return path.read_text(encoding="utf-8", errors="replace")
+            return "", JUNIT_OVER_LIMIT
+        return path.read_text(encoding="utf-8", errors="replace"), None
     except FileNotFoundError:
-        return ""
+        return "", None
+
+
+def snapshot_source() -> bytes:
+    """The snapshot module's source, as it is copied into a Docker regrade."""
+    return Path(snapshot.__file__).read_bytes()
 
 
 def stage_solution(task_dir: Path, solution: Stub | Literal["reference"], dest: Path) -> None:
@@ -392,10 +413,10 @@ class LocalRunner:
                 timed_out = done.code is None
                 return Regrade(RunResult(done.code, None, timed_out, output=tail(done.stdout)))
             solved = RunResult(0, None, timed_out=False, output="")
-            snapshot = root / "solved"
+            store = root / SNAPSHOT_DIR
             try:
-                shutil.copytree(workspace, snapshot, symlinks=True)
-            except OSError as exc:
+                snapshot.save(workspace, store)
+            except snapshot.SnapshotError as exc:
                 error = f"could not save the solved workspace for the reruns: {exc}"
                 return Regrade(solved, error=error)
             plugin = root / PLUGIN_DIR
@@ -406,9 +427,8 @@ class LocalRunner:
             for index, seed in enumerate(seeds):
                 if index:
                     try:
-                        shutil.rmtree(workspace)
-                        shutil.copytree(snapshot, workspace, symlinks=True)
-                    except OSError as exc:
+                        snapshot.restore(workspace, store)
+                    except snapshot.SnapshotError as exc:
                         error = f"could not restore the workspace before rerun {index + 1}: {exc}"
                         return Regrade(solved, tuple(runs), error=error)
                 junit.unlink(missing_ok=True)
@@ -418,7 +438,8 @@ class LocalRunner:
                     env=seeded_env(env, seed, plugin),
                     timeout=deadline - time.monotonic(),
                 )
-                runs.append(GraderRun(seed, graded.code, read_junit(junit), graded.stdout))
+                xml, problem = read_junit(junit)
+                runs.append(GraderRun(seed, graded.code, xml, graded.stdout, problem))
                 if graded.code is None:
                     break
             return Regrade(solved, tuple(runs))

@@ -38,7 +38,7 @@ from taskgate.registry import (
 )
 from taskgate.report import describe_config, to_json, to_markdown, to_text
 from taskgate.results import CheckReport, TaskReport
-from taskgate.runner import Runner
+from taskgate.runner import SOLUTION_ENTRY, Runner
 
 app = typer.Typer(
     name="taskgate",
@@ -349,6 +349,10 @@ def check(
         raise typer.Exit(1)
 
 
+GRADE_NEEDS = (f"solution/{SOLUTION_ENTRY}", "tests/")
+"""What ``taskgate grade`` needs besides ``task.toml`` to run a rerun at all."""
+
+
 @app.command()
 def grade(
     task: Annotated[Path, typer.Argument(help="Task directory (the one holding task.toml).")],
@@ -374,6 +378,11 @@ def grade(
     """
     if not (task / TASK_MANIFEST).is_file():
         raise _fail_usage(f"{task} is not a task directory (no {TASK_MANIFEST})")
+    missing = [part for part in GRADE_NEEDS if not (task / part.rstrip("/")).exists()]
+    if missing:
+        raise _fail_usage(
+            f"{task.as_posix()} cannot be graded: missing {', '.join(missing)} (see TG101)"
+        )
     config = _config(_registry(), config_path, lambda: discover(Path()))
     runner = _runner(runner_choice, config)
     timeout = manifest.load(task).timeout_sec
@@ -402,7 +411,7 @@ def grade(
     try:
         outcomes = parse_junit(run.junit)
     except JUnitError as exc:
-        typer.echo(f"({exc})")
+        typer.echo(f"({run.junit_problem or exc})")
         outcomes = {}
     for test, outcome in outcomes.items():
         typer.echo(f"{outcome:<7}  {test}")

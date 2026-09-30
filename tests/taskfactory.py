@@ -96,6 +96,43 @@ def test_one_word_per_line() -> None:
 ``PYTHONHASHSEED`` (TG401 runs both with 0; TG501's reruns change the grader's)."""
 
 
+HARD_LINK_SOLVE = """\
+#!/bin/sh
+set -eu
+mkdir -p output
+cp input/name.txt output/greeting.txt
+ln output/greeting.txt output/backup.txt
+mkfifo output/jobs
+echo token > output/locked.txt
+chmod 000 output/locked.txt
+chmod 664 output/greeting.txt
+sleep 0.3
+cp input/name.txt output/later.txt
+"""
+FAITHFUL_GRADER = """\
+import os
+import stat
+from pathlib import Path
+
+
+def test_the_output_is_as_the_solution_left_it() -> None:
+    out = Path("output")
+    assert os.path.samefile(out / "greeting.txt", out / "backup.txt")
+    assert stat.S_ISFIFO((out / "jobs").lstat().st_mode)
+    assert stat.S_IMODE((out / "locked.txt").stat().st_mode) == 0
+    assert stat.S_IMODE((out / "greeting.txt").stat().st_mode) == 0o664
+    assert (out / "later.txt").stat().st_mtime > (out / "greeting.txt").stat().st_mtime
+    assert not (out / "graded.marker").exists()
+    # Then change the workspace the way a careless grader might.
+    (out / "graded.marker").write_text("x")
+    (out / "greeting.txt").chmod(0o600)
+    (out / "backup.txt").unlink()
+    (out / "jobs").unlink()
+"""
+"""The review's cases: a hard link, a named pipe, an unreadable file, group-write bits and
+sub-second mtimes must look the same in every rerun, even after a grader changed them."""
+
+
 def make_task(
     task_dir: Path,
     *,

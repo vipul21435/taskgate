@@ -18,10 +18,12 @@ by the Dockerfile), lists the workspace before and after it, and runs
 step on stdout with a per-run nonce, so task output cannot forge a marker by
 accident. When the task's ``timeout_sec`` runs out, the container is killed.
 
-A regrade (TG501) is one container too: after ``solve.sh`` the driver saves the
-workdir as a tar in the tmpfs, runs the grader once per seed with the shuffle
-plugin, ``PYTHONHASHSEED`` and ``TASKGATE_SEED``, prints each run's JUnit XML
-between markers, and restores the workdir from the tar before the next run.
+A regrade (TG501) is one container too: after ``solve.sh`` the driver records
+the workdir with :mod:`taskgate.snapshot` (copied in as ``taskgate_snapshot.py``,
+its store in the tmpfs), runs the grader once per seed with the shuffle plugin,
+``PYTHONHASHSEED`` and ``TASKGATE_SEED``, prints each run's JUnit XML between
+markers (or marks it as over :data:`taskgate.runner.MAX_JUNIT_BYTES` without
+printing it), and puts back whatever the run changed before the next one.
 """
 
 from __future__ import annotations
@@ -46,8 +48,12 @@ from taskgate.dockerfile import locate
 from taskgate.files import IGNORED_DIRS, is_ignored
 from taskgate.runner import (
     JUNIT_FILE,
+    JUNIT_OVER_LIMIT,
+    MAX_JUNIT_BYTES,
     PLUGIN_DIR,
     PLUGIN_MODULE,
+    SNAPSHOT_DIR,
+    SNAPSHOT_MODULE,
     SOLUTION_ENTRY,
     BuildResult,
     Completed,
@@ -62,6 +68,7 @@ from taskgate.runner import (
     grader_argv,
     plugin_source,
     regrade_args,
+    snapshot_source,
     tail,
 )
 
@@ -81,7 +88,6 @@ MARK = "@@taskgate-"
 DIGEST_VERSION = b"taskgate-env-v1"
 BUILDKIT_REF = re.compile(r"\bref [a-z0-9]+::[a-z0-9]+")
 
-SNAPSHOT = "solved.tar"
 _RERUN = grader_argv('"$py"', '"$stage"') + regrade_args('"$seed"', f'"$stage/{JUNIT_FILE}"')
 DRIVER = f"""\
 nonce=$1 mode=$2 stage=$3
@@ -108,23 +114,29 @@ if [ "$mode" != regrade ]; then
     mark grader "$?"
     exit 0
 fi
-if ! tar -cf "$stage/{SNAPSHOT}" .; then mark snapshot-failed; exit 0; fi
+snap="$stage/{PLUGIN_DIR}/{SNAPSHOT_MODULE}.py"
+if ! "$py" "$snap" save . "$stage/{SNAPSHOT_DIR}" </dev/null; then mark snapshot-failed; exit 0; fi
 first=1
 for seed in "$@"; do
-    if [ "$first" = 0 ]; then
-        find . -mindepth 1 -delete
-        if ! tar -xf "$stage/{SNAPSHOT}"; then mark restore-failed "$seed"; exit 0; fi
+    if [ "$first" = 0 ] && ! "$py" "$snap" restore . "$stage/{SNAPSHOT_DIR}" </dev/null; then
+        mark restore-failed "$seed"
+        exit 0
     fi
     first=0
-    rm -f "${{stage:?}}/{JUNIT_FILE}"
+    junit="$stage/{JUNIT_FILE}"
+    rm -f "$junit"
     PYTHONHASHSEED=$seed TASKGATE_SEED=$seed \\
     PYTHONPATH="$stage/{PLUGIN_DIR}${{PYTHONPATH:+:$PYTHONPATH}}" \\
         {" ".join(_RERUN)} </dev/null
     code=$?
     mark regrade "$seed" "$code"
-    mark listing "junit-$seed"
-    cat "$stage/{JUNIT_FILE}" 2>/dev/null
-    mark listing end
+    if [ -f "$junit" ] && [ "$(($(wc -c <"$junit")))" -gt {MAX_JUNIT_BYTES} ]; then
+        mark junit-over-limit "$seed"
+    else
+        mark listing "junit-$seed"
+        cat "$junit" 2>/dev/null
+        mark listing end
+    fi
 done
 """
 """The in-container driver: ``sh -c DRIVER taskgate-driver NONCE MODE STAGE_DIR [SEED...]``.
@@ -229,7 +241,7 @@ def _add_dir(tar: tarfile.TarFile, name: str) -> None:
 
 def build_archive(task_dir: Path, solution: Solution, *, plugin: bool = False) -> bytes:
     """``tests/``, ``pytest.ini``, (unless ``none``) ``solution/`` and, for a regrade, the
-    shuffle plugin under ``plugin/``, as an uncompressed tar."""
+    shuffle plugin and the snapshot module under ``plugin/``, as an uncompressed tar."""
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w") as tar:
         tar.add(task_dir / "tests", arcname="tests", filter=_normalize)
@@ -241,6 +253,7 @@ def build_archive(task_dir: Path, solution: Solution, *, plugin: bool = False) -
         if plugin:
             _add_dir(tar, PLUGIN_DIR)
             _add_bytes(tar, f"{PLUGIN_DIR}/{PLUGIN_MODULE}.py", plugin_source(), 0o644)
+            _add_bytes(tar, f"{PLUGIN_DIR}/{SNAPSHOT_MODULE}.py", snapshot_source(), 0o644)
         _add_bytes(tar, "pytest.ini", b"[pytest]\n", 0o644)
     return buffer.getvalue()
 
@@ -347,24 +360,35 @@ def interpret(done: Completed, nonce: str) -> RunResult:
     )
 
 
+def _step_error(what: str, transcript: _Transcript, step: str) -> str:
+    """``what`` plus the last line the failed step printed (the snapshot module's reason)."""
+    why = _last_line("\n".join(transcript.outputs.get(step, [])))
+    return f"{what}: {why}" if why else what
+
+
 def interpret_regrade(done: Completed, nonce: str, seeds: Sequence[int]) -> Regrade:
     """Turn one ``docker run`` of :data:`DRIVER` in ``regrade`` mode into a :class:`Regrade`."""
     transcript = _Transcript.parse(done.stdout, nonce)
     if transcript.exit_code("solution") != 0:
         return Regrade(interpret(done, nonce))
     solved = RunResult(0, None, timed_out=False, output="")
+    over_limit = {value for event, value, _ in transcript.steps if event == "junit-over-limit"}
     runs: list[GraderRun] = []
     for event, value, output in transcript.steps:
         if event == "regrade":
             seed, _, code = value.partition(" ")
             junit = "\n".join(transcript.listings.get(f"junit-{seed}", []))
             exit_code = int(code) if code.lstrip("-").isdigit() else None
-            runs.append(GraderRun(int(seed), exit_code, junit, "\n".join(output).strip("\n")))
+            problem = JUNIT_OVER_LIMIT if seed in over_limit else None
+            text = "\n".join(output).strip("\n")
+            runs.append(GraderRun(int(seed), exit_code, junit, text, problem))
     error: str | None = None
     if "snapshot-failed" in transcript.events:
-        error = "could not save the solved workspace for the reruns"
+        saving = "could not save the solved workspace for the reruns"
+        error = _step_error(saving, transcript, "snapshot-failed")
     elif "restore-failed" in transcript.events:
-        error = f"could not restore the workspace before rerun {len(runs) + 1}"
+        restore = f"could not restore the workspace before rerun {len(runs) + 1}"
+        error = _step_error(restore, transcript, "restore-failed")
     elif len(runs) < len(seeds) and done.code is None:
         unfinished = "\n".join([*transcript.pending, *done.stderr.splitlines()])
         runs.append(GraderRun(seeds[len(runs)], None, "", unfinished))

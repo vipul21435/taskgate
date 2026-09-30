@@ -44,6 +44,11 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "PT", "N", "C4", "PTH", "RET"]
 
+[tool.ruff.lint.per-file-ignores]
+# Runs inside task images under their own Python (3.8 and later), where
+# Path.readlink and Path.hardlink_to do not exist yet; it uses os functions throughout.
+"src/taskgate/snapshot.py" = ["PTH"]
+
 [tool.mypy]
 strict = true
 python_version = "3.12"

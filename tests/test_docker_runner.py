@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from fakedocker import FakeDocker
-from taskfactory import ORDER_DEPENDENT_GRADER, make_task
+from taskfactory import FAITHFUL_GRADER, HARD_LINK_SOLVE, ORDER_DEPENDENT_GRADER, make_task
 from taskgate.config import RunnerOptions
 from taskgate.determinism import parse_junit
 from taskgate.docker_runner import (
@@ -29,7 +29,17 @@ from taskgate.docker_runner import (
     select_runner,
 )
 from taskgate.dockerfile import locate
-from taskgate.runner import Completed, GraderRun, LocalRunner, Regrade, Stub, plugin_source
+from taskgate.runner import (
+    JUNIT_OVER_LIMIT,
+    MAX_JUNIT_BYTES,
+    Completed,
+    GraderRun,
+    LocalRunner,
+    Regrade,
+    Stub,
+    plugin_source,
+    snapshot_source,
+)
 
 EXISTS_ONLY = (
     "from pathlib import Path\n\n"
@@ -510,6 +520,9 @@ def test_regrade_archive_carries_the_shuffle_plugin(tmp_path: Path) -> None:
         plugin = tar.extractfile("plugin/taskgate_shuffle.py")
         assert plugin is not None
         assert plugin.read() == plugin_source()
+        module = tar.extractfile("plugin/taskgate_snapshot.py")
+        assert module is not None
+        assert module.read() == snapshot_source()
     with tarfile.open(fileobj=io.BytesIO(build_archive(task, "reference"))) as tar:
         assert "plugin" not in tar.getnames()
 
@@ -550,18 +563,51 @@ def test_interpret_regrade_edge_cases() -> None:
     def regrade(code: int, stdout: str, seeds: tuple[int, ...]) -> Regrade:
         return interpret_regrade(Completed(code, stdout, ""), nonce, seeds)
 
-    snapshot = regrade(0, f"{solved}tar: full\n{mark} snapshot-failed\n", (1,))
+    snapshot = regrade(0, f"{solved}output/x: Permission denied\n{mark} snapshot-failed\n", (1,))
     assert snapshot.runs == ()
-    assert snapshot.error == "could not save the solved workspace for the reruns"
+    assert snapshot.error == (
+        "could not save the solved workspace for the reruns: output/x: Permission denied"
+    )
+    silent = regrade(0, f"{solved}{mark} snapshot-failed\n", (1,))
+    assert silent.error == "could not save the solved workspace for the reruns"
     one = (
         f"{solved}1 passed\n{mark} regrade 1 0\n{mark} listing junit-1\n<t/>\n{mark} listing end\n"
     )
-    restore = regrade(0, f"{one}{mark} restore-failed 2\n", (1, 2))
+    restore = regrade(0, f"{one}marker: Operation not permitted\n{mark} restore-failed 2\n", (1, 2))
     assert restore.runs == (GraderRun(1, 0, "<t/>", "1 passed"),)
-    assert restore.error == "could not restore the workspace before rerun 2"
+    assert restore.error == (
+        "could not restore the workspace before rerun 2: marker: Operation not permitted"
+    )
+    big = regrade(0, f"{solved}1 passed\n{mark} regrade 1 0\n{mark} junit-over-limit 1\n", (1,))
+    assert big.runs == (GraderRun(1, 0, "", "1 passed", JUNIT_OVER_LIMIT),)
     oom = regrade(137, one, (1, 2))
     assert oom.error == "the container exited 137 after 1 of 2 reruns (killed: out of memory?)"
     assert regrade(1, one, (1, 2, 3)).error == "the container exited 1 after 1 of 3 reruns"
     assert regrade(0, f"{solved}{mark} regrade 4 x\n", (4,)).runs == (GraderRun(4, None, "", ""),)
     unsolved = regrade(0, f"{mark} setup-failed\n", (1,))
     assert unsolved.solution.error == "could not unpack the solution and tests into the container"
+
+
+def test_regrade_in_a_container_sees_the_solved_workspace_exactly(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    task = make_task(tmp_path / "echo", solve=HARD_LINK_SOLVE, grader=FAITHFUL_GRADER)
+    regraded = DockerRunner().regrade(task, seeds=(1, 2, 3), timeout_sec=60)
+    assert regraded.error is None
+    assert [r.exit for r in regraded.runs] == [0, 0, 0], regraded.runs[-1].output
+
+
+def test_the_container_driver_caps_junit_like_the_local_runner(
+    tmp_path: Path, fake_docker: FakeDocker
+) -> None:
+    grader = (
+        "def test_big(record_property) -> None:\n"
+        f"    record_property('output', 'x' * ({MAX_JUNIT_BYTES} + 1))\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    docker = DockerRunner().regrade(task, seeds=(1,), timeout_sec=60)
+    local = LocalRunner().regrade(task, seeds=(1,), timeout_sec=60)
+    assert [(r.exit, r.junit, r.junit_problem) for r in docker.runs] == [(0, "", JUNIT_OVER_LIMIT)]
+    assert [(r.exit, r.junit, r.junit_problem) for r in local.runs] == [
+        (r.exit, r.junit, r.junit_problem) for r in docker.runs
+    ]

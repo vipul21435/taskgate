@@ -8,8 +8,9 @@ every test that flipped: its outcome differs between reruns, or it failed in
 every rerun although the grader passed TG401's run (file order,
 ``PYTHONHASHSEED=0``), so it flipped against that run.
 
-The XML comes from the task's own grader process, so it is read only up to
-:data:`taskgate.runner.MAX_JUNIT_BYTES` and parsed with the standard library's
+The XML comes from the task's own grader process, so both runners read it only
+up to :data:`taskgate.runner.MAX_JUNIT_BYTES` (a bigger file is reported as such,
+not parsed) and parse it with the standard library's
 expat parser, which does not resolve external entities and, since expat 2.4.1,
 refuses entity-expansion bombs (a test checks both).
 """
@@ -118,6 +119,9 @@ def rerun(number: int, run: GraderRun) -> Rerun:
     """Read one :class:`GraderRun`'s outcomes."""
     if run.exit is None:
         return Rerun(number, run.seed, None, {}, "did not finish within the budget")
+    if run.junit_problem is not None:
+        problem = f"pytest exited {run.exit} with {run.junit_problem}"
+        return Rerun(number, run.seed, run.exit, {}, problem)
     try:
         outcomes = parse_junit(run.junit)
     except JUnitError as exc:

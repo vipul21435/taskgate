@@ -4,9 +4,17 @@ from pathlib import Path
 
 import pytest
 
-from taskfactory import LENIENT_GRADER, ORDER_DEPENDENT_GRADER, make_task
+from taskfactory import (
+    FAITHFUL_GRADER,
+    HARD_LINK_SOLVE,
+    LENIENT_GRADER,
+    ORDER_DEPENDENT_GRADER,
+    make_task,
+)
+from taskgate import snapshot
 from taskgate.determinism import parse_junit
 from taskgate.runner import (
+    JUNIT_OVER_LIMIT,
     MAX_JUNIT_BYTES,
     LocalRunner,
     RunResult,
@@ -277,29 +285,57 @@ def test_regrade_stops_when_the_budget_runs_out(tmp_path: Path, runner: LocalRun
     assert [(run.seed, run.exit, run.junit) for run in regraded.runs] == [(1, None, "")]
 
 
-def test_regrade_reports_a_workspace_it_cannot_restore(tmp_path: Path, runner: LocalRunner) -> None:
+def test_regrade_restores_a_directory_the_grader_locked(
+    tmp_path: Path, runner: LocalRunner
+) -> None:
     grader = (
         "from pathlib import Path\n\n"
         "def test_locks_a_directory() -> None:\n"
-        "    Path('locked').mkdir(exist_ok=True)\n"
+        "    assert not Path('locked').exists()\n"
+        "    Path('locked').mkdir()\n"
         "    Path('locked/file').write_text('x')\n"
         "    Path('locked').chmod(0o500)\n"
     )
     task = make_task(tmp_path / "echo", grader=grader)
+    regraded = runner.regrade(task, seeds=(1, 2, 3), timeout_sec=60)
+    assert regraded.error is None
+    assert [run.exit for run in regraded.runs] == [0, 0, 0]
+
+
+def test_regrade_reports_a_workspace_it_cannot_restore_without_temp_paths(
+    tmp_path: Path, runner: LocalRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grader = (
+        "from pathlib import Path\n\n"
+        "def test_marks() -> None:\n"
+        "    Path('output/graded.marker').write_text('x')\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    real = os.unlink
+
+    def unlink(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith("graded.marker") and "dir_fd" not in kwargs:
+            raise PermissionError(1, "Operation not permitted")
+        real(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "unlink", unlink)
     regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=60)
     assert [run.exit for run in regraded.runs] == [0]
-    assert regraded.error is not None
-    assert regraded.error.startswith("could not restore the workspace before rerun 2: ")
+    assert regraded.error == (
+        "could not restore the workspace before rerun 2: "
+        "output/graded.marker: Operation not permitted"
+    )
 
 
 def test_read_junit_skips_missing_and_oversized_files(tmp_path: Path) -> None:
     path = tmp_path / "junit.xml"
-    assert read_junit(path) == ""
+    assert read_junit(path) == ("", None)
     path.write_text("<testsuite/>", encoding="utf-8")
-    assert read_junit(path) == "<testsuite/>"
+    assert read_junit(path) == ("<testsuite/>", None)
     with path.open("wb") as handle:
         handle.truncate(MAX_JUNIT_BYTES + 1)
-    assert read_junit(path) == ""
+    assert read_junit(path) == ("", JUNIT_OVER_LIMIT)
+    assert JUNIT_OVER_LIMIT == "JUnit XML over the 8 MiB limit (not read)"
 
 
 def test_seeded_env_puts_the_plugin_first_on_pythonpath(tmp_path: Path) -> None:
@@ -313,11 +349,37 @@ def test_seeded_env_puts_the_plugin_first_on_pythonpath(tmp_path: Path) -> None:
     assert seeded_env({}, 0, tmp_path)["PYTHONPATH"] == str(tmp_path)
 
 
-def test_regrade_reports_a_workspace_it_cannot_save(tmp_path: Path, runner: LocalRunner) -> None:
-    solve = "#!/bin/sh\nset -eu\nmkfifo pipe\n"
+def test_regrade_reports_a_workspace_it_cannot_save_without_temp_paths(
+    tmp_path: Path, runner: LocalRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    solve = "#!/bin/sh\nset -eu\nmkdir -p output/hidden\nchmod 000 output/hidden\n"
     task = make_task(tmp_path / "echo", solve=solve)
+    real = os.geteuid()
+    monkeypatch.setattr(snapshot.os, "geteuid", lambda: real + 1)
     regraded = runner.regrade(task, seeds=(1, 2), timeout_sec=60)
     assert regraded.solution.solution_exit == 0
     assert regraded.runs == ()
-    assert regraded.error is not None
-    assert regraded.error.startswith("could not save the solved workspace for the reruns: ")
+    assert regraded.error == (
+        "could not save the solved workspace for the reruns: output/hidden: Permission denied"
+    )
+
+
+def test_every_rerun_sees_the_solved_workspace_exactly(tmp_path: Path, runner: LocalRunner) -> None:
+    task = make_task(tmp_path / "echo", solve=HARD_LINK_SOLVE, grader=FAITHFUL_GRADER)
+    regraded = runner.regrade(task, seeds=(1, 2, 3, 4, 5), timeout_sec=60)
+    assert regraded.error is None
+    outcomes = [parse_junit(run.junit) for run in regraded.runs]
+    assert [run.exit for run in regraded.runs] == [0] * 5, regraded.runs[-1].output
+    assert all(set(found.values()) == {"passed"} for found in outcomes)
+    assert all(len(found) == 1 for found in outcomes)
+
+
+def test_regrade_reports_junit_over_the_limit(tmp_path: Path, runner: LocalRunner) -> None:
+    grader = (
+        "def test_big(record_property) -> None:\n"
+        f"    record_property('output', 'x' * ({MAX_JUNIT_BYTES} + 1))\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    regraded = runner.regrade(task, seeds=(1,), timeout_sec=60)
+    (run,) = regraded.runs
+    assert (run.exit, run.junit, run.junit_problem) == (0, "", JUNIT_OVER_LIMIT)

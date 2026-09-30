@@ -15,12 +15,19 @@ from pathlib import Path
 
 import pytest
 
+from taskfactory import (
+    COPY_WORKSPACE,
+    DOCKERFILE,
+    FAITHFUL_GRADER,
+    HARD_LINK_SOLVE,
+    make_task,
+)
 from taskgate.config import RunnerOptions
 from taskgate.docker_runner import DockerRunner, docker_status
 from taskgate.engine import run_gates
 from taskgate.gates import BUILTIN_GATES
 from taskgate.results import Status
-from taskgate.runner import LocalRunner
+from taskgate.runner import MAX_JUNIT_BYTES, LocalRunner
 
 pytestmark = pytest.mark.docker
 
@@ -172,3 +179,50 @@ def test_the_determinism_gate_finds_the_same_flips_in_docker(
     assert [d.replace("--runner docker", "--runner local") for d in in_docker.details] == list(
         local.details
     )
+
+
+RUNTIME_GATES = tuple(g for g in BUILTIN_GATES if g.code in ("TG101", "TG401", "TG501"))
+WORLD_WRITABLE_WORKDIR = DOCKERFILE.replace(
+    "mkdir /workspace && chown agent /workspace", "mkdir -m 777 /workspace"
+).format(copy=COPY_WORKSPACE)
+
+
+def tg501(task: Path, runner: DockerRunner | LocalRunner) -> tuple[Status, str, tuple[str, ...]]:
+    results = {r.code: r for r in run_gates(task, gates=RUNTIME_GATES, runner=runner)}
+    assert results["TG401"].status is Status.PASS, results["TG401"].message
+    result = results["TG501"]
+    return result.status, result.message, result.details
+
+
+def test_reruns_restore_a_root_owned_world_writable_workdir(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    """Review finding: tar could not reset the workdir's own times and mode, so every
+    task in a ``mkdir -m 777`` workdir failed TG501."""
+    task = make_task(tmp_path / "echo", dockerfile=WORLD_WRITABLE_WORKDIR)
+    status, message, _ = tg501(task, runner)
+    assert status is Status.PASS, message
+
+
+def test_reruns_keep_modes_links_pipes_and_subsecond_mtimes(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    """Review finding: reruns 2-5 lost group-write bits and sub-second mtimes."""
+    task = make_task(tmp_path / "echo", solve=HARD_LINK_SOLVE, grader=FAITHFUL_GRADER)
+    status, message, _ = tg501(task, runner)
+    assert status is Status.PASS, message
+
+
+def test_junit_over_the_limit_gives_the_same_verdict_on_both_runners(
+    tmp_path: Path, runner: DockerRunner
+) -> None:
+    grader = (
+        "def test_big(record_property) -> None:\n"
+        f"    record_property('output', 'x' * ({MAX_JUNIT_BYTES} + 1))\n"
+    )
+    task = make_task(tmp_path / "echo", grader=grader)
+    status, message, details = tg501(task, runner)
+    local = tg501(task, LocalRunner())
+    assert status is Status.FAIL
+    assert (status, message) == local[:2]
+    assert [d.replace("--runner docker", "--runner local") for d in details] == list(local[2])
