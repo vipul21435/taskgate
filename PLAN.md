@@ -27,7 +27,8 @@ passes the same review gates before it is accepted.
   TG4xx solution and baselines, TG5xx determinism, TG6xx reserved.
   Severities are `error` (blocking), `warning` and `info`.
 - **Exit codes:** 0 when no blocking gate fails, 1 when one does, 2 for usage
-  errors (bad path, bad base ref).
+  errors (bad path, bad base ref), 3 for a crash (added 2026-09-30 so a crash
+  is never read as a verdict).
 - **Offline by default:** tests and `make demo` need no network, no Docker and no
   tokens. Docker is used when available; a local subprocess runner is the
   fallback. GitHub is reached only through a client with a configurable base
@@ -376,6 +377,29 @@ passes the same review gates before it is accepted.
   runs. The slice-1 stash `wip from interrupted agent` was compared with the
   committed `config.py` and `manifest.py` once more, found fully superseded,
   and dropped (the refresh task allows dropping a stash that is not useful).
+
+- **Review fixes, composite action (2026-09-30):** two findings from the late
+  slice-5 review, re-confirmed on `4534bc8`, fixed with regression tests that
+  fail on that commit.
+  - A crash exited 1 and the action took any code up to 1 as a finished
+    check, then published whatever `report.json` sat in `out` (stale, or
+    committed by the pull request) and echoed its raw `blocking_failures`
+    into `GITHUB_OUTPUT`. Now `main()` maps an unexpected exception to exit
+    3; `check --out` writes each report to a new file and renames it over the
+    name (a committed symlink is replaced, not followed; an unwritable
+    directory is exit 2); the action deletes the three reports before the
+    check and reads the count from the report parsed by TaskGate, which must
+    agree with the exit code. Decision: the default `out` stays
+    `.taskgate/out` (changing it would break workflows that upload it); the
+    remaining case, a pull request that commits the directory itself as a
+    symlink, is under Known issues.
+  - A fork's `pull_request` run has a read-only token, so publish's 403 failed
+    the job. Decision: publish is still attempted (a private repository can
+    send write tokens to forks), and exit 1 on a fork's `pull_request` event
+    becomes a warning; `fail-on-blocking` then decides the job. Other
+    read-only tokens (Dependabot) still fail the step, under Known issues.
+  - `make check`: 554 passed, 9 skipped, 100% line and branch coverage of
+    3936 statements and 1076 branches.
 
 ## Scaffold (done)
 

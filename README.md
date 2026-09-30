@@ -677,7 +677,7 @@ flowchart LR
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 544 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test) in 120 s; 100% line and branch coverage of `src/` (3913 statements, 1076 branches); gate is 90% |
+| Tests and coverage | `make cov` | 554 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test) in 132 s; 100% line and branch coverage of `src/` (3936 statements, 1076 branches); gate is 90% |
 | Real-Docker tests | `time make test-docker` | 8 passed in 18.5 s (task images already built), including TG501 in a real container finding the same flips as the local runner, restoring a root-owned `mkdir -m 777` workdir, keeping mode bits, hard links, pipes and sub-second mtimes across reruns, and capping JUnit XML like the local runner |
 | Demo wall time, local runner | `time make demo` | 9.53 to 9.93 s over three runs in a fresh clone and 9.01 to 9.68 s in the working copy (four pull requests, the cached re-check and the GitHub part against the fake API) |
 | Demo wall time, Docker runner | `time make demo-docker` | 8.76 s on both of two runs with the four task images built |
