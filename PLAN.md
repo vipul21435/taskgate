@@ -400,6 +400,23 @@ passes the same review gates before it is accepted.
     read-only tokens (Dependabot) still fail the step, under Known issues.
   - `make check`: 554 passed, 9 skipped, 100% line and branch coverage of
     3936 statements and 1076 branches.
+- **Review fix, report validator (2026-09-30):** a read-only check of
+  `f89bf85` found that the validator added for the finding above ran
+  `"$PYTHON" -` in the pull request's checkout, where Python puts the working
+  directory first on `sys.path`: a committed `pathlib.py` or `taskgate/`
+  package replaced the standard library or TaskGate's parser and forged the
+  verdict, the reports and `GITHUB_OUTPUT`, with the Docker runner too.
+  Decision: run the validator with `-I` (isolated mode) rather than moving it
+  into a new CLI subcommand, and also require the printed count to be digits
+  before it reaches `GITHUB_OUTPUT`. Regression tests commit both shadows and
+  fail without `-I`. The local runner's exposure in the action (PR code runs
+  on the host with the step's token and outputs) is stated under Known issues;
+  it is the local runner's trust model, not something the validator can fix.
+  Checked that uv 0.11.29 does not read a `uv.toml` from the working
+  directory when `--project` is given, so the install step is not exposed the
+  same way.
+  - `make check`: 557 passed, 9 skipped, 100% line and branch coverage of
+    3936 statements and 1076 branches.
 
 ## Scaffold (done)
 

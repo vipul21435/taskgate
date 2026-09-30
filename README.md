@@ -209,7 +209,11 @@ answer should be) is the most common way a task goes wrong.
   verdict and `blocking-failures` from the report this run wrote, parsed by
   TaskGate and required to agree with the exit code (any other exit code, or
   a missing or disagreeing report, fails the step), so an earlier run's report
-  or one committed in the pull request is never published. It
+  or one committed in the pull request is never published. That parse runs
+  in Python's isolated mode (`-I`), so a `pathlib.py` or `taskgate/` package
+  the pull request commits in the checkout is not imported in place of the
+  standard library or TaskGate, and the step fails unless the count it prints
+  is digits only. It
   fails the step on a blocking gate unless `fail-on-blocking: "false"`, and
   exposes `result`, `blocking-failures`, `report-dir` and `exit-code` outputs:
 
@@ -677,7 +681,7 @@ flowchart LR
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 554 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test) in 132 s; 100% line and branch coverage of `src/` (3936 statements, 1076 branches); gate is 90% |
+| Tests and coverage | `make cov` | 557 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test) in 201 to 213 s over two runs on a machine shared with other jobs; 100% line and branch coverage of `src/` (3936 statements, 1076 branches); gate is 90% |
 | Real-Docker tests | `time make test-docker` | 8 passed in 18.5 s (task images already built), including TG501 in a real container finding the same flips as the local runner, restoring a root-owned `mkdir -m 777` workdir, keeping mode bits, hard links, pipes and sub-second mtimes across reruns, and capping JUnit XML like the local runner |
 | Demo wall time, local runner | `time make demo` | 9.53 to 9.93 s over three runs in a fresh clone and 9.01 to 9.68 s in the working copy (four pull requests, the cached re-check and the GitHub part against the fake API) |
 | Demo wall time, Docker runner | `time make demo-docker` | 8.76 s on both of two runs with the four task images built |
@@ -821,6 +825,14 @@ flowchart LR
   current user with network and filesystem access, and the grader uses
   TaskGate's own Python 3.12 and pytest, so a task that needs other packages only
   passes on the Docker runner.
+- In the action, the same holds on the runner host: with `runner: local`, or
+  `auto` when Docker does not answer, a pull request's `solve.sh` and grader
+  run with the step's environment (`GITHUB_TOKEN`, `GITHUB_OUTPUT`,
+  `GITHUB_ENV`) and can write to TaskGate's installed environment, so they
+  can change the verdict the action reports. The protections against
+  committed reports and modules above hold only with the Docker runner; set
+  `runner: docker` (exit 2 without Docker) when checking untrusted pull
+  requests.
 - On both runners the tests are present (in a separate directory) while
   `solve.sh` runs, so a reference solution could read them; the grader is not
   hidden from the solution.
