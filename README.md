@@ -177,12 +177,15 @@ answer should be) is the most common way a task goes wrong.
   call, the rest with updates). `taskgate check --pr N` takes the changed files
   from the pull request's file list (100 per page, following the `Link`
   header, and refusing a list the API truncated at 3000 files) instead of
-  `git diff`. The token is sent only to the configured base URL, pagination
-  links to other hosts are refused, and error messages never carry it.
+  `git diff`. The token is sent only to the configured base URL: HTTP
+  redirects are not followed (a 3xx is an error naming its `Location`),
+  pagination links to other hosts are refused, and error messages never
+  carry it.
 - **An in-process fake GitHub API** (`fakegithub.py`, standard library only)
   serves the same endpoints from a thread, records every request, paginates
   with `Link` headers, answers 401 to a wrong token and 422 to more than 50
-  annotations in one request, as GitHub does. The tests, `make demo` and the
+  annotations in one request, a comment over 65536 characters or a check-run
+  summary over 65535 bytes, as GitHub does. The tests, `make demo` and the
   CI job that runs the composite action all post to it; `python -m
   taskgate.fakegithub --port 8765` serves it to another process and
   `GET /_fake/state` returns what it recorded.
@@ -867,8 +870,9 @@ flowchart LR
   task roots; it changes where the changed paths come from, not the need for
   `fetch-depth: 0`. The action's `pr-files` input is off by default.
 - Every `publish` creates a new check run rather than updating the previous
-  one, and the comment body and check-run summary are cut at GitHub's 65536
-  characters with a note (the files under `--out` are never cut).
+  one. The comment body is cut at GitHub's 65536 characters and the check-run
+  summary at its 65535 UTF-8 bytes, each with a note (the files under `--out`
+  are never cut).
 - The fake API implements only the endpoints TaskGate calls, with the
   behaviours the client depends on; it is not a general GitHub emulator, and a
   wrong assumption about an endpoint it does not cover would show up only

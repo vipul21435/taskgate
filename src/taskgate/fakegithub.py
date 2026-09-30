@@ -10,7 +10,8 @@ limits where TaskGate depends on them:
 - ``GET``/``POST /repos/{repo}/issues/{n}/comments`` (paginated) and
   ``PATCH /repos/{repo}/issues/comments/{id}``;
 - ``POST /repos/{repo}/check-runs`` and ``PATCH /repos/{repo}/check-runs/{id}``,
-  which answer 422 to more than 50 annotations in one request, as GitHub does.
+  which answer 422 to more than 50 annotations in one request or a summary over
+  65535 bytes, as GitHub does; a comment body over 65536 characters is 422 too.
 
 Requests without ``Authorization: Bearer <token>`` get 401 when the fake has a
 token; unknown routes get 404. ``GET /_fake/state`` returns the recorded
@@ -40,6 +41,11 @@ HTML_BASE = "https://github.example"
 
 DEFAULT_TOKEN = "fake-token"
 ANNOTATION_LIMIT = 50
+COMMENT_LIMIT = 65536
+"""Characters in a comment body (GitHub: "Body is too long (maximum is 65536 characters)")."""
+
+SUMMARY_LIMIT = 65535
+"""Bytes in a check run's ``output.summary`` (GitHub: "summary exceeds a maximum bytesize")."""
 MAX_PER_PAGE = 100
 
 
@@ -225,12 +231,12 @@ class FakeGitHub:
             if method == "GET":
                 return self._page(self.state.comments.get(number, []), path, query)
             if method == "POST":
-                return _Reply(201, self._store_comment(number, _text(body, "body"), "taskgate"))
+                return _Reply(201, self._store_comment(number, _comment(body), "taskgate"))
         if (match := re.fullmatch(r"/issues/comments/(\d+)", route)) and method == "PATCH":
             for comments in self.state.comments.values():
                 for comment in comments:
                     if comment["id"] == int(match[1]):
-                        comment["body"] = _text(body, "body")
+                        comment["body"] = _comment(body)
                         return _Reply(200, comment)
             raise _error(404, "Not Found")
         if route == "/check-runs" and method == "POST":
@@ -325,6 +331,13 @@ def _text(body: Any, key: str) -> str:
     return value
 
 
+def _comment(body: Any) -> str:
+    text = _text(body, "body")
+    if len(text) > COMMENT_LIMIT:
+        raise _error(422, f"Body is too long (maximum is {COMMENT_LIMIT} characters)")
+    return text
+
+
 def _output(body: Any) -> dict[str, Any]:
     output = body.get("output") if isinstance(body, dict) else None
     if not isinstance(output, dict):
@@ -334,9 +347,12 @@ def _output(body: Any) -> dict[str, Any]:
         raise _error(
             422, f"Invalid request. Only {ANNOTATION_LIMIT} annotations are allowed per request."
         )
+    summary = _text(output, "summary")
+    if len(summary.encode("utf-8")) > SUMMARY_LIMIT:
+        raise _error(422, f"summary exceeds a maximum bytesize of {SUMMARY_LIMIT}")
     return {
         "title": _text(output, "title"),
-        "summary": _text(output, "summary"),
+        "summary": summary,
         "annotations": list(annotations),
     }
 

@@ -17,7 +17,9 @@ It does three things, each with the fewest calls the API allows:
 The base URL comes from ``TASKGATE_GITHUB_API`` (default
 ``https://api.github.com``; the tests and ``make demo`` point it at
 :mod:`taskgate.fakegithub`) and the token from ``GITHUB_TOKEN``. The token is
-sent only to that base URL, and error messages never include it.
+sent only to that base URL: HTTP redirects are never followed (a 3xx answer is
+an error naming the ``Location``), pagination links to another host are
+refused, and error messages never include the token.
 """
 
 from __future__ import annotations
@@ -45,7 +47,10 @@ ANNOTATION_BATCH = 50
 PER_PAGE = 100
 MAX_LISTED_FILES = 3000
 MAX_BODY = 65536
-"""GitHub's limit on a comment body and on a check run's ``output.summary`` (characters)."""
+"""GitHub's limit on a comment body (characters)."""
+
+MAX_SUMMARY_BYTES = 65535
+"""GitHub's limit on a check run's ``output.summary`` and ``output.text`` (bytes)."""
 
 MAX_TITLE = 255
 TRUNCATED = "\n\n(truncated: the full report is in report.md and report.json)\n"
@@ -121,6 +126,14 @@ def fit(text: str, limit: int = MAX_BODY) -> str:
     return text[: limit - len(TRUNCATED)] + TRUNCATED
 
 
+def fit_bytes(text: str, limit: int = MAX_SUMMARY_BYTES) -> str:
+    """``text`` cut to ``limit`` UTF-8 bytes (never inside a character), with a note."""
+    if len(text.encode("utf-8")) <= limit:
+        return text
+    room = limit - len(TRUNCATED.encode("utf-8"))
+    return text.encode("utf-8")[:room].decode("utf-8", errors="ignore") + TRUNCATED
+
+
 def comment_body(markdown: str) -> str:
     """The summary comment's body: the hidden marker, then the report (cut to fit)."""
     return fit(f"{MARKER}\n{markdown}")
@@ -129,6 +142,26 @@ def comment_body(markdown: str) -> str:
 def batches(items: Sequence[Annotation], size: int = ANNOTATION_BATCH) -> list[list[Annotation]]:
     """``items`` in consecutive groups of at most ``size``; one empty group for no items."""
     return [list(items[start : start + size]) for start in range(0, len(items), size)] or [[]]
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect: following one would send the token to another URL."""
+
+    def redirect_request(  # type: ignore[override]
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: Mapping[str, str],
+        newurl: str,
+    ) -> None:
+        raise GitHubError(
+            f"HTTP {code}: redirect to {newurl} not followed (the token is sent only to {API_ENV})"
+        )
+
+
+_opener = urllib.request.build_opener(_NoRedirects())
 
 
 class GitHubClient:
@@ -179,9 +212,11 @@ class GitHubClient:
         request = urllib.request.Request(url, data=data, headers=headers, method=method)
         where = f"{method} {url.removeprefix(self.api)}"
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with _opener.open(request, timeout=self.timeout) as response:
                 raw = response.read()
                 link = response.headers.get("Link")
+        except GitHubError as exc:
+            raise GitHubError(f"{where}: {exc}") from None
         except urllib.error.HTTPError as exc:
             raise GitHubError(f"{where}: HTTP {exc.code}: {_message(exc)}") from exc
         except (urllib.error.URLError, OSError) as exc:
@@ -252,7 +287,7 @@ class GitHubClient:
         def output(group: list[Annotation]) -> dict[str, Any]:
             return {
                 "title": title[:MAX_TITLE],
-                "summary": fit(summary),
+                "summary": fit_bytes(summary),
                 "annotations": [annotation.to_api() for annotation in group],
             }
 

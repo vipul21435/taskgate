@@ -11,7 +11,8 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 from email.message import Message
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, ClassVar
 
 import pytest
 
@@ -21,6 +22,7 @@ from taskgate.github import (
     ANNOTATION_BATCH,
     MARKER,
     MAX_BODY,
+    MAX_SUMMARY_BYTES,
     TRUNCATED,
     Annotation,
     GitHubClient,
@@ -29,6 +31,7 @@ from taskgate.github import (
     batches,
     comment_body,
     fit,
+    fit_bytes,
 )
 
 REPO = "sample/tasks"
@@ -217,13 +220,15 @@ class Canned:
 def serve(monkeypatch: pytest.MonkeyPatch, *responses: Canned | Exception) -> None:
     queue = list(responses)
 
-    def urlopen(request: urllib.request.Request, timeout: float) -> Canned:
-        reply = queue.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
+    class Opener:
+        @staticmethod
+        def open(request: urllib.request.Request, timeout: float) -> Canned:
+            reply = queue.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
 
-    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(github, "_opener", Opener())
 
 
 def test_odd_responses_are_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -258,6 +263,14 @@ def test_long_bodies_are_cut_with_a_note() -> None:
     long = fit("x" * (MAX_BODY + 10))
     assert len(long) == MAX_BODY
     assert long.endswith(TRUNCATED)
+    assert fit_bytes("short") == "short"
+    assert fit_bytes("x" * MAX_SUMMARY_BYTES) == "x" * MAX_SUMMARY_BYTES
+    cut = fit_bytes("x" * (MAX_SUMMARY_BYTES + 1))
+    assert len(cut.encode("utf-8")) == MAX_SUMMARY_BYTES
+    assert cut.endswith(TRUNCATED)
+    wide = fit_bytes("\u00e9" * MAX_SUMMARY_BYTES)  # two bytes each: cut by bytes, not characters
+    assert len(wide.encode("utf-8")) <= MAX_SUMMARY_BYTES
+    assert wide.endswith("\u00e9" + TRUNCATED)  # never cut inside a character
     assert comment_body("## TaskGate").startswith(f"{MARKER}\n## TaskGate")
     assert batches([]) == [[]]
     title = Annotation("a", "failure", "t" * 300, "m").to_api()["title"]
@@ -342,3 +355,86 @@ def test_the_fake_updates_the_right_comment_and_stops_cleanly(
         runpy.run_path(fakegithub.__file__, run_name="__main__")
     assert exited.value.code == 0
     assert "--port" in capsys.readouterr().out
+
+
+def test_check_run_summaries_fit_githubs_byte_limit(fake: FakeGitHub) -> None:
+    """A report over 65535 bytes is cut before it is sent; the fake answers 422 to
+    one that is not, as GitHub does (its limit is bytes, one under the comment's)."""
+    summary = "\u00e9" * 40_000  # 80000 bytes, 40000 characters
+    api = client(fake)
+    run = api.create_check_run(
+        name="TaskGate", head_sha="a" * 40, conclusion="failure", title="t", summary=summary
+    )
+    (sent,) = fake.check_runs()
+    assert run.requests == 1
+    assert len(sent["output"]["summary"].encode("utf-8")) <= MAX_SUMMARY_BYTES
+    assert sent["output"]["summary"].endswith(TRUNCATED)
+    status, reply = request(
+        fake,
+        "POST",
+        f"/repos/{REPO}/check-runs",
+        json.dumps(
+            {
+                "name": "x",
+                "head_sha": "a" * 40,
+                "output": {"title": "t", "summary": "x" * (MAX_SUMMARY_BYTES + 1)},
+            }
+        ).encode(),
+    )
+    assert (status, reply["message"]) == (422, "summary exceeds a maximum bytesize of 65535")
+    status, reply = request(
+        fake,
+        "POST",
+        f"/repos/{REPO}/issues/1/comments",
+        json.dumps({"body": "x" * (MAX_BODY + 1)}).encode(),
+    )
+    assert (status, reply["message"]) == (422, "Body is too long (maximum is 65536 characters)")
+    assert api.upsert_comment(1, "x" * (MAX_BODY + 1)).action == "created"
+
+
+class Redirecting(BaseHTTPRequestHandler):
+    """An API that answers every request with a redirect to another host."""
+
+    target = ""
+    seen: ClassVar[list[str]] = []
+
+    def do_GET(self) -> None:
+        self.seen.append(self.path)
+        self.send_response(302)
+        self.send_header("Location", self.target + self.path)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self) -> None:
+        self.do_GET()
+
+    def log_message(self, *args: object) -> None:
+        return None
+
+
+def test_redirects_are_not_followed_so_the_token_stays_home(fake: FakeGitHub) -> None:
+    """urllib would copy the Authorization header to the Location host; the client
+    refuses the redirect instead and names it."""
+    Redirecting.target = fake.url
+    Redirecting.seen = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Redirecting)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        api = GitHubClient(REPO, token="s3cret-token", api=f"http://127.0.0.1:{server.server_port}")
+        with pytest.raises(GitHubError) as failed:
+            api.pull_request_files(1)
+        assert str(failed.value) == (
+            f"GET /repos/{REPO}/pulls/1: HTTP 302: redirect to {fake.url}/repos/{REPO}/pulls/1 "
+            "not followed (the token is sent only to TASKGATE_GITHUB_API)"
+        )
+        with pytest.raises(GitHubError, match=r"HTTP 302: redirect to .* not followed"):
+            api.upsert_comment(1, "hello")
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert Redirecting.seen == [
+        f"/repos/{REPO}/pulls/1",
+        f"/repos/{REPO}/issues/1/comments?per_page=100",
+    ]
+    assert fake.requests == []
