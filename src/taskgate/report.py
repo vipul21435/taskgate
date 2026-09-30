@@ -26,8 +26,10 @@ def _plural(count: int, word: str) -> str:
 
 
 def _scope(report: CheckReport) -> str:
+    cached = f", {report.cached} cached" if report.cached else ""
     if report.mode == "all":
-        return f"all tasks, {_plural(len(report.tasks), 'task')}, {report.runner} runner"
+        tasks = _plural(len(report.tasks), "task")
+        return f"all tasks, {tasks}, {report.runner} runner{cached}"
     merge_base = (report.merge_base or "")[:SHORT_SHA]
     scope = (
         f"diff against {report.base} (merge base {merge_base}), "
@@ -35,7 +37,7 @@ def _scope(report: CheckReport) -> str:
     )
     if report.other_files:
         scope += f", {_plural(len(report.other_files), 'other file')}"
-    return f"{scope}, {report.runner} runner"
+    return f"{scope}, {report.runner} runner{cached}"
 
 
 def describe_config(config: ConfigSummary) -> str | None:
@@ -69,7 +71,8 @@ def _result_line(report: CheckReport) -> str:
 
 def _task_header(task: TaskReport) -> str:
     change = f"  {task.change}" if task.change else ""
-    return f"{task.path}{change}  {task.verdict.upper()}"
+    cached = "  (cached)" if task.cached else ""
+    return f"{task.path}{change}  {task.verdict.upper()}{cached}"
 
 
 def to_text(report: CheckReport) -> str:
@@ -135,17 +138,21 @@ def to_markdown(report: CheckReport) -> str:
         for task in report.tasks:
             blocking = ", ".join(r.code for r in task.results if r.blocking) or "-"
             verdict_cell = f"**{task.verdict}**" if task.verdict == "fail" else task.verdict
+            if task.cached:
+                verdict_cell += " (cached)"
             lines.append(f"| `{task.path}` | {task.change or '-'} | {verdict_cell} | {blocking} |")
         lines.append("")
     for task in report.tasks:
         if not task.results:
             continue
-        lines += [
-            f"### `{task.path}`",
-            "",
-            "| Gate | Status | Message |",
-            "| --- | --- | --- |",
-        ]
+        lines += [f"### `{task.path}`", ""]
+        if task.cached:
+            lines += [
+                "Cached result: the task's content, the TaskGate build, the gates, the "
+                "config and the runner match an earlier run, so the gates did not run again.",
+                "",
+            ]
+        lines += ["| Gate | Status | Message |", "| --- | --- | --- |"]
         lines += [
             f"| {r.code} {r.name} | {_status_cell(r)} | {_cell(r.message)} |" for r in task.results
         ]
@@ -190,6 +197,7 @@ def to_dict(report: CheckReport) -> dict[str, Any]:
                 "path": task.path,
                 "change": task.change,
                 "verdict": task.verdict,
+                "cached": task.cached,
                 "blocking_failures": task.blocking_failures,
                 "changed_files": list(task.changed_files),
                 "gates": [_result_dict(result) for result in task.results],

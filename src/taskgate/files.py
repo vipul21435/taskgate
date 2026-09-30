@@ -14,9 +14,10 @@ from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePosixPath
 
 IGNORED_DIRS: frozenset[str] = frozenset(
-    {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+    {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".taskgate"}
 )
-"""Directories that hold tool caches, never task content."""
+"""Directories that hold tool caches (TaskGate's own result cache among them), never
+task content."""
 
 IGNORED_FILES: frozenset[str] = frozenset({".DS_Store"})
 IGNORED_SUFFIXES: tuple[str, ...] = (".pyc",)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -11,6 +12,7 @@ from typing import Annotated
 import typer
 
 from taskgate import __version__, manifest
+from taskgate.cache import DEFAULT_CACHE_DIR, CachedChecks, CacheError, CacheStats, ResultCache
 from taskgate.changes import GitError, changed_tasks, read_file_at, repo_root
 from taskgate.config import (
     CONFIG_FILE,
@@ -146,7 +148,54 @@ def _runner(choice: RunnerChoice, config: Config) -> Runner:
     return runner
 
 
-def _check_all(root: Path, config_path: Path | None, choice: RunnerChoice) -> CheckReport:
+def _note(message: str) -> None:
+    typer.echo(f"note: {message}", err=True)
+
+
+def _cache_dir(root: Path, cache_dir: Path | None) -> Path:
+    """``--cache-dir`` when given, else ``.taskgate/cache`` under ``root``."""
+    return cache_dir if cache_dir is not None else root / DEFAULT_CACHE_DIR
+
+
+def _checks(
+    root: Path, cache: CacheSettings, registry: Registry, config: Config, runner: Runner
+) -> CachedChecks:
+    store = None if cache.off else ResultCache(_cache_dir(root, cache.directory))
+    return CachedChecks(store, registry.gates, config, runner, note=_note)
+
+
+def _task_report(
+    checks: CachedChecks,
+    root: Path,
+    path: str,
+    change: str | None,
+    tracked: tuple[str, ...] | None = None,
+    changed_files: tuple[str, ...] = (),
+) -> TaskReport:
+    """One task's report: from the cache when it has a hit, else from a run of the gates."""
+    if change == "removed":
+        return TaskReport(path=path, change=change, changed_files=changed_files)
+    results, cached = checks.results(
+        root / path,
+        label=path,
+        tracked=tracked,
+        compute=lambda: run_gates(
+            root / path,
+            gates=checks.gates,
+            config=checks.config,
+            runner=checks.runner,
+            tracked=tracked,
+            label=path,
+        ),
+    )
+    return TaskReport(
+        path=path, change=change, results=results, changed_files=changed_files, cached=cached
+    )
+
+
+def _check_all(
+    root: Path, config_path: Path | None, choice: RunnerChoice, cache: CacheSettings
+) -> CheckReport:
     try:
         found = find_tasks(root)
     except NotADirectoryError as exc:
@@ -154,20 +203,9 @@ def _check_all(root: Path, config_path: Path | None, choice: RunnerChoice) -> Ch
     registry = _registry()
     config = _config(registry, config_path, lambda: discover(root))
     runner = _runner(choice, config)
-    tasks = tuple(
-        TaskReport(
-            path=task.path.as_posix(),
-            change=None,
-            results=run_gates(
-                root / task.path,
-                gates=registry.gates,
-                config=config,
-                runner=runner,
-                label=task.path.as_posix(),
-            ),
-        )
-        for task in found
-    )
+    checks = _checks(root, cache, registry, config, runner)
+    tasks = tuple(_task_report(checks, root, task.path.as_posix(), None) for task in found)
+    checks.close()
     return CheckReport(
         version=__version__,
         mode="all",
@@ -178,7 +216,11 @@ def _check_all(root: Path, config_path: Path | None, choice: RunnerChoice) -> Ch
 
 
 def _check_diff(
-    repo: Path, base: str | None, config_path: Path | None, choice: RunnerChoice
+    repo: Path,
+    base: str | None,
+    config_path: Path | None,
+    choice: RunnerChoice,
+    cache: CacheSettings,
 ) -> CheckReport:
     try:
         root = repo_root(repo)
@@ -188,24 +230,14 @@ def _check_diff(
     registry = _registry()
     config = _config(registry, config_path, lambda: _config_at(root, changes.base))
     runner = _runner(choice, config)
+    checks = _checks(root, cache, registry, config, runner)
     tasks = tuple(
-        TaskReport(
-            path=task.path.as_posix(),
-            change=task.change,
-            results=()
-            if task.change == "removed"
-            else run_gates(
-                root / task.path,
-                gates=registry.gates,
-                config=config,
-                runner=runner,
-                tracked=task.tracked,
-                label=task.path.as_posix(),
-            ),
-            changed_files=task.files,
+        _task_report(
+            checks, root, task.path.as_posix(), task.change, task.tracked, changed_files=task.files
         )
         for task in changes.tasks
     )
+    checks.close()
     return CheckReport(
         version=__version__,
         mode="diff",
@@ -229,6 +261,27 @@ RunnerOption = Annotated[
         ),
     ),
 ]
+
+CacheDirOption = Annotated[
+    Path | None,
+    typer.Option(
+        "--cache-dir",
+        envvar="TASKGATE_CACHE_DIR",
+        help=(
+            "Result cache directory. Default: .taskgate/cache under the repository root "
+            "(diff mode) or the checked directory (--all)."
+        ),
+    ),
+]
+
+
+@dataclass(frozen=True, slots=True)
+class CacheSettings:
+    """``--no-cache`` and ``--cache-dir`` of one ``check``."""
+
+    off: bool = False
+    directory: Path | None = None
+
 
 ConfigOption = Annotated[
     Path | None,
@@ -265,15 +318,26 @@ def check(
     ] = OutputFormat.TEXT,
     config_path: ConfigOption = None,
     runner_choice: RunnerOption = RunnerChoice.AUTO,
+    no_cache: Annotated[
+        bool,
+        typer.Option(
+            "--no-cache", help="Run every gate on every task; neither read nor write the cache."
+        ),
+    ] = False,
+    cache_dir: CacheDirOption = None,
 ) -> None:
     """Run the review gates on the tasks a pull request changes.
 
-    Exits 0 when no blocking gate fails, 1 when one does, and 2 on usage errors.
+    A task whose content, TaskGate build, gates, config and runner match an
+    earlier passing run is not checked again: its results come from the cache
+    and reports mark it cached. Exits 0 when no blocking gate fails, 1 when one
+    does, and 2 on usage errors.
     """
+    cache = CacheSettings(off=no_cache, directory=cache_dir)
     report = (
-        _check_all(repo.resolve(), config_path, runner_choice)
+        _check_all(repo.resolve(), config_path, runner_choice, cache)
         if all_tasks
-        else _check_diff(repo, base, config_path, runner_choice)
+        else _check_diff(repo, base, config_path, runner_choice, cache)
     )
     typer.echo(RENDERERS[output_format](report), nl=False)
     if out is not None:
@@ -416,6 +480,128 @@ def gates(
         typer.echo(json.dumps(_gate_json(registry, config), indent=2))
     else:
         typer.echo("\n".join(_gate_lines(registry, config)))
+
+
+cache_app = typer.Typer(
+    name="cache",
+    help="Inspect and prune the result cache that lets taskgate check skip unchanged tasks.",
+    no_args_is_help=True,
+)
+app.add_typer(cache_app)
+
+CacheRoot = Annotated[
+    Path,
+    typer.Argument(
+        help="Repository root or --all directory whose .taskgate/cache to use.",
+    ),
+]
+
+
+def _count(count: int, word: str) -> str:
+    plural = word + ("es" if word.endswith("s") else "s")
+    return f"{count} {word if count == 1 else plural}"
+
+
+def _size(size: int) -> str:
+    return f"{size} B" if size < 1024 else f"{size / 1024:.1f} KiB"
+
+
+def _stats_json(stats: CacheStats) -> dict[str, object]:
+    counts = stats.counts
+    return {
+        "directory": str(stats.directory),
+        "entries": len(stats.entries),
+        "bytes": stats.size,
+        "current": stats.current,
+        "stale": len(stats.entries) - stats.current,
+        "tasks": stats.tasks,
+        "runners": stats.runners,
+        "hits": counts.hits,
+        "misses": counts.misses,
+        "stored": counts.stored,
+        "not_stored": counts.not_stored,
+    }
+
+
+def _stats_lines(stats: CacheStats) -> list[str]:
+    counts = stats.counts
+    runners = ", ".join(f"{name} {count}" for name, count in stats.runners.items()) or "-"
+    stale = len(stats.entries) - stats.current
+    lookups = counts.hits + counts.misses
+    rate = f" ({100 * counts.hits / lookups:.0f}% hits)" if lookups else ""
+    return [
+        f"cache      {stats.directory}",
+        f"entries    {len(stats.entries)} ({_size(stats.size)}): {stats.current} usable by this "
+        f"taskgate build, {stale} stale (taskgate cache prune removes them)",
+        f"tasks      {stats.tasks} (runners: {runners})",
+        f"lookups    {_count(counts.hits, 'hit')}, {_count(counts.misses, 'miss')}{rate}",
+        f"stored     {_count(counts.stored, 'result set')}; {counts.not_stored} not stored "
+        "because a blocking gate failed",
+    ]
+
+
+@cache_app.command("stats")
+def cache_stats(
+    root: CacheRoot = Path(),
+    cache_dir: CacheDirOption = None,
+    as_json: Annotated[bool, typer.Option("--json", help="Print JSON instead of text.")] = False,
+) -> None:
+    """Show how many results the cache holds and how often checks hit it."""
+    stats = ResultCache(_cache_dir(root, cache_dir)).stats()
+    if as_json:
+        typer.echo(json.dumps(_stats_json(stats), indent=2))
+    else:
+        typer.echo("\n".join(_stats_lines(stats)))
+
+
+PRUNE_TEXT = {
+    "all": "removed by --all",
+    "stale": "from another taskgate build or cache format",
+    "unreadable": "unreadable",
+    "superseded": "superseded by a newer entry for the same task and runner",
+    "unused": "unused for longer than --older-than",
+}
+
+
+@cache_app.command("prune")
+def cache_prune(
+    root: CacheRoot = Path(),
+    cache_dir: CacheDirOption = None,
+    older_than: Annotated[
+        float | None,
+        typer.Option(
+            "--older-than", min=0, help="Also remove entries not used for this many days."
+        ),
+    ] = None,
+    everything: Annotated[bool, typer.Option("--all", help="Remove every entry.")] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Only say what would be removed.")
+    ] = False,
+) -> None:
+    """Remove cache entries no check can hit, and older ones for the same task.
+
+    By default that is entries written by another TaskGate build or cache
+    format, unreadable ones, and all but the most recently used entry for each
+    task and runner.
+    """
+    cache = ResultCache(_cache_dir(root, cache_dir))
+    try:
+        pruned = cache.prune(
+            everything=everything,
+            older_than_sec=None if older_than is None else older_than * 86400,
+            dry_run=dry_run,
+        )
+    except CacheError as exc:
+        raise _fail_usage(str(exc)) from exc
+    verb = "would remove" if dry_run else "removed"
+    reasons = "; ".join(
+        f"{len(entries)} {PRUNE_TEXT[reason]}" for reason, entries in pruned.removed.items()
+    )
+    typer.echo(
+        f"{verb} {pruned.count} of {pruned.count + len(pruned.kept)} entries "
+        f"({_size(pruned.size)}){': ' + reasons if reasons else ''}; "
+        f"{len(pruned.kept)} kept in {cache.directory}"
+    )
 
 
 def main() -> None:

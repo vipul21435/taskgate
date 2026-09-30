@@ -59,6 +59,8 @@ class TaskReport:
 
     results: tuple[GateResult, ...] = ()
     changed_files: tuple[str, ...] = ()
+    cached: bool = False
+    """True when the results came from the result cache instead of a run of the gates."""
 
     @property
     def checked(self) -> bool:
@@ -114,6 +116,11 @@ class CheckReport:
     @property
     def blocking_failures(self) -> int:
         return sum(task.blocking_failures for task in self.tasks)
+
+    @property
+    def cached(self) -> int:
+        """How many tasks' results came from the result cache."""
+        return sum(task.cached for task in self.tasks)
 
     @property
     def passed(self) -> bool:

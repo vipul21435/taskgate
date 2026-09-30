@@ -18,6 +18,15 @@ def local_runner_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TASKGATE_RUNNER", "local")
 
 
+@pytest.fixture(autouse=True)
+def private_result_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """CLI runs in tests keep their result cache in the test's own temp directory, so no
+    test writes into the source tree or sees another test's cache."""
+    cache = tmp_path / "result-cache"
+    monkeypatch.setenv("TASKGATE_CACHE_DIR", str(cache))
+    return cache
+
+
 @pytest.fixture
 def repo(tmp_path: Path) -> GitRepo:
     return GitRepo(tmp_path / "repo")

@@ -225,6 +225,48 @@ passes the same review gates before it is accepted.
     Docker runner's created-file listing leaving out cache files; both
     mutations from the review now fail the suite.
 
+- **Slice 4 decisions (2026-09-30):**
+  - The key is two hashes. `task_digest` covers the task alone: every
+    directory, regular file and symlink by sorted relative POSIX path, with file
+    bytes and the full permission bits (a superset of "executable bits": a
+    read-only input changes what `solve.sh` can do on both runners), symlink
+    targets, and never mtimes, owners or walk order. `cache_key` adds the
+    TaskGate build, the gates, the effective config, the runner and the task's
+    label and directory name.
+  - "TaskGate version" is `version+<12 hex of its own *.py files>`: the version
+    string stays 0.1.0 across commits, so a version-only key would replay
+    results of older code in a working checkout. Plugin gates add a digest of
+    their module's source for the same reason.
+  - Ignored files are the ones `files.is_ignored` names, now including
+    `.taskgate/` itself (a task at the repository root would otherwise hash its
+    own cache). In diff mode the tracked path list is hashed as well, with the
+    content of tracked files whatever their names, because the hygiene gates
+    read exactly that list; so diff mode and `--all` never share an entry.
+  - The runner's name, Python, pytest and platform are in the key, since the
+    local runner grades with TaskGate's own interpreter; the Docker image is
+    already covered by the task content (its Dockerfile and pinned bases).
+  - Only results with no blocking failure are stored: a failing task is
+    re-checked every run, so a transient failure (Docker hiccup, timeout under
+    load) is never replayed, and a failing pull request has to change anyway.
+  - A symlink that leaves the task (or loops) makes the task uncacheable, with a
+    note on stderr, instead of hashing content outside it.
+  - Location: `.taskgate/cache` under the repository root (diff mode) or the
+    `--all` directory, `--cache-dir` / `TASKGATE_CACHE_DIR` to move it. The
+    directory gets a `.gitignore` of `*` and a `CACHEDIR.TAG`, as pytest does,
+    so `git status` stays clean in a checked repository.
+  - Entries are one JSON file per key, written with mkstemp + fsync +
+    `os.replace` under an exclusive `flock` on `<cache>/lock` (10 s timeout);
+    lookups take no lock. `stats.json` sums hits, misses, stores and
+    not-stored across runs under the same lock. A hit bumps the entry's mtime,
+    which `prune` reads as last use.
+  - `prune` by default removes entries of another build or cache format,
+    unreadable ones and all but the most recently used entry per (task, runner);
+    `--older-than DAYS`, `--all` and `--dry-run` extend it.
+  - Any cache failure (unwritable directory, lock timeout) is a stderr note and
+    turns the cache off for the rest of that run; it never changes the exit
+    code. The tests point `TASKGATE_CACHE_DIR` at each test's temp directory so
+    no test writes into the source tree.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
