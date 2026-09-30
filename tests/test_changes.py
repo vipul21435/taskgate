@@ -1,8 +1,10 @@
+import os
+import subprocess
 from pathlib import Path, PurePosixPath
 
 import pytest
 
-from gitrepo import GitRepo
+from gitrepo import GIT_ENV, GitRepo
 from taskgate import changes
 from taskgate.changes import (
     ChangedTask,
@@ -191,3 +193,27 @@ def test_missing_git_binary_is_an_error(tmp_path: Path, monkeypatch: pytest.Monk
     monkeypatch.setattr(changes.subprocess, "run", no_git)
     with pytest.raises(GitError, match="not installed"):
         repo_root(tmp_path)
+
+
+def test_a_path_that_is_not_utf8_is_a_git_error_not_a_crash(repo: GitRepo) -> None:
+    """A pull request can commit a path git prints as raw bytes; that is a usage
+    error (exit 2 in the CLI), never an uncaught UnicodeDecodeError."""
+    repo.write("README.md", "# Tasks\n")
+    repo.commit("base")
+    repo.branch("feature")
+    add_task(repo, "tasks/echo")
+    repo.commit("add echo")
+    blob = repo.git("hash-object", "-w", "--stdin").strip()
+    subprocess.run(
+        ["git", "-C", str(repo.root), "update-index", "-z", "--add", "--index-info"],
+        input=b"100644 " + blob.encode() + b"\tnotes/caf\xe9.txt\0",
+        check=True,
+        env={**os.environ, **GIT_ENV},
+    )
+    subprocess.run(
+        ["git", "-C", str(repo.root), "commit", "-q", "-m", "odd path"],
+        check=True,
+        env={**os.environ, **GIT_ENV},
+    )
+    with pytest.raises(GitError, match="not valid UTF-8"):
+        changed_tasks(repo.root, "main")

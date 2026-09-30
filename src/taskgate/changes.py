@@ -69,6 +69,11 @@ def git(repo: Path, *args: str) -> str:
         )
     except FileNotFoundError as exc:
         raise GitError("git is not installed or not on PATH") from exc
+    except UnicodeDecodeError as exc:
+        raise GitError(
+            f"git {' '.join(args)}: the output is not valid UTF-8 (a path in the repository "
+            "is not UTF-8 encoded; TaskGate needs UTF-8 paths)"
+        ) from exc
     if proc.returncode != 0:
         detail = proc.stderr.strip() or f"exit code {proc.returncode}"
         raise GitError(f"git {' '.join(args)}: {detail}")
