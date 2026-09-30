@@ -9,6 +9,8 @@ branding:
 # report.json and junit.xml, appends the Markdown report to the job summary,
 # emits an annotation per failed gate, and on a pull request keeps one summary
 # comment up to date and creates a check run (annotations 50 per request).
+# A fork's pull_request run has a read-only token: a refused publish is then a
+# warning, and fail-on-blocking still decides the job.
 # Check out with `fetch-depth: 0` so the base branch's history is available.
 
 inputs:
@@ -174,13 +176,26 @@ runs:
         PREFIX: ${{ steps.check.outputs.path-prefix }}
         GITHUB_TOKEN: ${{ inputs.github-token }}
         TASKGATE_GITHUB_API: ${{ inputs.github-api }}
+        FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
       run: |
         set -euo pipefail
         args=(publish "$INPUT_OUT/report.json" --pr "$INPUT_PR" --repo "$GITHUB_REPOSITORY"
               --check-name "$INPUT_CHECK_NAME" --path-prefix "$PREFIX")
         if [ "$INPUT_COMMENT" != true ]; then args+=(--no-comment); fi
         if [ "$INPUT_CHECK_RUN" = true ]; then args+=(--sha "$INPUT_HEAD_SHA"); else args+=(--no-check-run); fi
+        set +e
         "$TASKGATE" "${args[@]}"
+        code=$?
+        set -e
+        # On pull_request events from a fork GitHub hands the job a read-only token,
+        # so the API refuses the comment and the check run (exit 1). That must not
+        # fail the job: the verdict is in the job summary and the annotations, and
+        # the next step still fails it on a blocking gate.
+        if [ "$code" -eq 1 ] && [ "$FORK" = true ]; then
+          echo "::warning title=TaskGate::could not post to pull request #$INPUT_PR: a pull request from a fork gets a read-only token on pull_request events; the result is in the job summary and the annotations"
+          exit 0
+        fi
+        exit "$code"
 
     - name: Fail on blocking gates
       if: ${{ inputs.fail-on-blocking == 'true' && steps.check.outputs.exit-code == '1' }}

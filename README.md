@@ -229,6 +229,12 @@ answer should be) is the most common way a task goes wrong.
         - uses: vipul21435/taskgate@main
   ```
 
+  On `pull_request` events from a fork, GitHub gives the job a read-only token
+  whatever the `permissions` block says, so the API refuses the comment and
+  the check run. The action then prints a warning instead of failing the
+  step; the report is still in the job summary and the annotations, and
+  `fail-on-blocking` still decides the job.
+
   Inputs: `path`, `base`, `all`, `runner`, `config`, `out`, `pr-files` (take
   the changed files from the pull request), `pr`, `head-sha`, `comment`,
   `check-run`, `check-name`, `github-token`, `github-api`, `path-prefix` and
@@ -898,6 +904,12 @@ flowchart LR
   one. The comment body is cut at GitHub's 65536 characters and the check-run
   summary at its 65535 UTF-8 bytes, each with a note (the files under `--out`
   are never cut).
+- The action lets a refused publish pass only for a pull request from a fork
+  on a `pull_request` event. Any other read-only token (a Dependabot pull
+  request, or a workflow whose `permissions` leave out `pull-requests: write`
+  or `checks: write`) still fails the step at publish (exit 1). A fork's
+  refusal is also not told apart from an unreachable API: both give the
+  warning.
 - The action's default `out` (`.taskgate/out`) is inside the checkout. The
   report files are replaced rather than written through, but if a pull request
   commits `.taskgate/out` (or `.taskgate`) itself as a symlink to a directory,

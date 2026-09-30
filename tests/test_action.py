@@ -23,7 +23,7 @@ import pytest
 
 from gitrepo import GitRepo
 from taskfactory import make_task
-from taskgate.fakegithub import DEFAULT_TOKEN, FakeGitHub
+from taskgate.fakegithub import DEFAULT_TOKEN, FakeGitHub, _error, _Reply
 from taskgate.github import MARKER
 from taskgate.report import to_json
 from taskgate.results import CheckReport, GateResult, Severity, Status, TaskReport
@@ -474,3 +474,55 @@ def test_the_blocking_count_comes_from_the_parsed_report_not_its_raw_field(
         "path-prefix": "",
     }
     assert done["Fail on blocking gates"].returncode == 1
+
+
+class ReadOnlyGitHub(FakeGitHub):
+    """The fake as a read-only token sees it: every write is refused with 403."""
+
+    def _route(self, method: str, path: str, query: dict[str, str], body: object) -> _Reply:
+        if method in {"POST", "PATCH"}:
+            raise _error(403, "Resource not accessible by integration")
+        return super()._route(method, path, query, body)
+
+
+FORK = {
+    "event_name": "pull_request",
+    "event.pull_request.head.repo.full_name": "contributor/tasks",
+}
+SAME_REPO = {**FORK, "event.pull_request.head.repo.full_name": REPO}
+
+
+@pytest.mark.parametrize(
+    ("event", "solve", "steps", "report_code", "last_code"),
+    [
+        pytest.param(FORK, None, 2, 0, 0, id="fork-passing"),
+        pytest.param(FORK, FAILING_SOLVE, 3, 0, 1, id="fork-blocking-still-fails"),
+        pytest.param(SAME_REPO, None, 2, 1, 1, id="same-repo-refusal-still-fails"),
+    ],
+)
+def test_a_fork_pull_request_read_only_token_does_not_decide_the_job(
+    tmp_path: Path,
+    repo: GitRepo,
+    event: dict[str, str],
+    solve: str | None,
+    steps: int,
+    report_code: int,
+    last_code: int,
+) -> None:
+    pull_request_repo(repo, solve=solve)
+    repo.commit("add tasks/broken")
+    with ReadOnlyGitHub(REPO) as read_only:
+        inputs = {"pr": "9", "head-sha": "c" * 40, "out": str(tmp_path / "out")}
+        runner = harness(tmp_path, read_only, inputs, event, GITHUB_BASE_REF="main")
+        done = run_action(runner, repo.root, tmp_path)
+        refused = [(r.method, r.status) for r in read_only.requests]
+    names = ["Run the gates", "Report to the pull request", "Fail on blocking gates"]
+    assert list(done) == names[:steps]
+    assert done["Run the gates"].returncode == 0
+    report = done["Report to the pull request"]
+    assert report.returncode == report_code, report.stderr
+    assert "HTTP 403: Resource not accessible by integration" in report.stderr
+    assert ("POST", 403) in refused
+    warned = "::warning title=TaskGate::could not post to pull request #9" in report.stdout
+    assert warned is (event is FORK)
+    assert list(done.values())[-1].returncode == last_code
