@@ -9,6 +9,7 @@ here) and points ``TASKGATE`` at this environment's console script.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -24,6 +25,8 @@ from gitrepo import GitRepo
 from taskfactory import make_task
 from taskgate.fakegithub import DEFAULT_TOKEN, FakeGitHub
 from taskgate.github import MARKER
+from taskgate.report import to_json
+from taskgate.results import CheckReport, GateResult, Severity, Status, TaskReport
 
 ROOT = Path(__file__).resolve().parents[1]
 ACTION = ROOT / "action.yml"
@@ -104,6 +107,7 @@ class Runner:
         self.github = github
         self.outputs: dict[str, dict[str, str]] = {}
         self.environ = environ
+        self.taskgate = str(Path(sys.executable).with_name("taskgate"))
 
     def value(self, expression: str) -> str:
         """Evaluate one ``${{ }}`` expression."""
@@ -135,7 +139,7 @@ class Runner:
 
     def run(self, step: Step, cwd: Path) -> subprocess.CompletedProcess[str]:
         env = {**self.environ, **{k: self.substitute(v) for k, v in step.env.items()}}
-        env["TASKGATE"] = str(Path(sys.executable).with_name("taskgate"))
+        env["TASKGATE"] = self.taskgate
         env["PYTHON"] = sys.executable
         return subprocess.run(
             ["bash", "-c", step.run], cwd=cwd, env=env, capture_output=True, text=True, check=False
@@ -155,14 +159,23 @@ def fake() -> Iterator[FakeGitHub]:
         yield server
 
 
-def harness(tmp_path: Path, fake: FakeGitHub, inputs: dict[str, str], **extra: str) -> Runner:
+def harness(
+    tmp_path: Path,
+    fake: FakeGitHub,
+    inputs: dict[str, str],
+    event: dict[str, str] | None = None,
+    **extra: str,
+) -> Runner:
     github = {
         "action_path": str(ROOT),
         "token": DEFAULT_TOKEN,
         "api_url": fake.url,
         "sha": "f" * 40,
+        "repository": REPO,
+        "event_name": "push",
         "event.pull_request.number": "",
         "event.pull_request.head.sha": "",
+        **(event or {}),
     }
     (tmp_path / "output").write_text("", encoding="utf-8")
     (tmp_path / "summary.md").write_text("", encoding="utf-8")
@@ -315,3 +328,149 @@ def test_a_usage_error_fails_the_check_step(tmp_path: Path, fake: FakeGitHub) ->
     assert list(done) == ["Run the gates"]
     assert done["Run the gates"].returncode == 2
     assert "error:" in done["Run the gates"].stderr
+
+
+FAILING_SOLVE = "#!/bin/sh\nexit 0\n"
+"""A reference solution that writes nothing, so TG401 (solution-passes) fails."""
+
+
+def forged_report(*, passing: bool, blocking_field: str) -> str:
+    """A report.json with one task (passing or failing TG401) whose top-level
+    ``blocking_failures`` is ``blocking_field``, a string that smuggles extra outputs."""
+    result = GateResult(
+        "TG401",
+        "solution-passes",
+        Severity.ERROR,
+        Status.PASS if passing else Status.FAIL,
+        "the grader passed" if passing else "the grader failed",
+    )
+    report = CheckReport(
+        version="0.1.0",
+        mode="diff",
+        base="origin/main",
+        tasks=(TaskReport("tasks/broken", "added", (result,)),),
+    )
+    data = json.loads(to_json(report))
+    data["blocking_failures"] = blocking_field
+    return json.dumps(data, indent=2) + "\n"
+
+
+def pull_request_repo(repo: GitRepo, *, solve: str | None = None) -> GitRepo:
+    """main holds a README; the checked-out branch ``pr`` adds tasks/broken."""
+    repo.write("README.md", "# Tasks\n")
+    repo.commit("base")
+    repo.git("update-ref", "refs/remotes/origin/main", "main")
+    repo.branch("pr")
+    make_task(repo.root / "tasks" / "broken", **({} if solve is None else {"solve": solve}))
+    return repo
+
+
+def test_reports_committed_in_the_pull_request_are_never_taken_for_this_run(
+    tmp_path: Path, fake: FakeGitHub, repo: GitRepo
+) -> None:
+    pull_request_repo(repo, solve=FAILING_SOLVE)
+    out = repo.root / ".taskgate" / "out"
+    out.mkdir(parents=True)
+    injected = "0\nexit-code=0\nresult=pass"
+    (out / "report.json").write_text(
+        forged_report(passing=True, blocking_field=injected), encoding="utf-8"
+    )
+    read_only = tmp_path / "read-only.md"
+    read_only.write_text("not a report\n", encoding="utf-8")
+    read_only.chmod(0o444)
+    (out / "report.md").symlink_to(read_only)
+    repo.commit("add tasks/broken with a report of its own")
+    runner = harness(tmp_path, fake, {"pr": "9", "head-sha": "c" * 40}, GITHUB_BASE_REF="main")
+    assert runner.inputs["out"] == ".taskgate/out"
+    done = run_action(runner, repo.root, tmp_path)
+    assert list(done) == ["Run the gates", "Report to the pull request", "Fail on blocking gates"]
+    check = done["Run the gates"]
+    assert check.returncode == 0, check.stderr
+    assert "FAIL  TG401" in check.stdout
+    assert runner.outputs["check"]["exit-code"] == "1"
+    assert runner.outputs["check"]["result"] == "fail"
+    assert runner.outputs["check"]["blocking-failures"] == "1"
+    assert not (out / "report.md").is_symlink()
+    assert read_only.read_text(encoding="utf-8") == "not a report\n"
+    (run,) = fake.check_runs()
+    assert run["conclusion"] == "failure"
+    (comment,) = fake.comments(9)
+    assert comment["body"].startswith(f"{MARKER}\n## TaskGate: FAIL\n")
+    assert done["Fail on blocking gates"].returncode == 1
+
+
+def fake_taskgate(tmp_path: Path, runner: Runner, check: str) -> None:
+    """Make the action run ``check`` (shell, with ``$out`` set to --out) for
+    ``taskgate check`` instead of TaskGate; other commands still run the real one."""
+    script = tmp_path / "fake-taskgate"
+    script.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = check ]; then\n'
+        '  out="$4"  # the action passes: check PATH --out OUT ...\n'
+        f"  {check}\n"
+        "fi\n"
+        f'exec "{runner.taskgate}" "$@"\n',
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    runner.taskgate = str(script)
+
+
+@pytest.mark.parametrize(
+    ("check", "error"),
+    [
+        pytest.param("exit 1", "without a readable", id="exit-1-and-no-report"),
+        pytest.param(
+            'mkdir -p "$out"; cp "$FORGED" "$out/report.json"; : > "$out/report.md"; exit 1',
+            "disagrees with exit code 1",
+            id="a-passing-report-with-exit-1",
+        ),
+    ],
+)
+def test_a_check_that_left_no_matching_report_fails_the_step_and_publishes_nothing(
+    tmp_path: Path, fake: FakeGitHub, check: str, error: str
+) -> None:
+    out = tmp_path / "out"
+    out.mkdir()
+    stale = forged_report(passing=True, blocking_field="0")
+    (out / "report.json").write_text(stale, encoding="utf-8")
+    (out / "report.md").write_text("## TaskGate: PASS\n", encoding="utf-8")
+    (tmp_path / "forged.json").write_text(stale, encoding="utf-8")
+    inputs = {"path": ".", "all": "true", "pr": "9", "head-sha": "c" * 40, "out": str(out)}
+    runner = harness(tmp_path, fake, inputs, FORGED=str(tmp_path / "forged.json"))
+    fake_taskgate(tmp_path, runner, check)
+    done = run_action(runner, tmp_path, tmp_path)
+    assert list(done) == ["Run the gates"]
+    failed = done["Run the gates"]
+    assert failed.returncode != 0
+    assert error in failed.stderr
+    assert "exit-code" not in runner.outputs.get("check", {})
+    assert (tmp_path / "summary.md").read_text(encoding="utf-8") == ""
+    assert fake.requests == []
+
+
+def test_the_blocking_count_comes_from_the_parsed_report_not_its_raw_field(
+    tmp_path: Path, fake: FakeGitHub
+) -> None:
+    out = tmp_path / "out"
+    injected = "1\nexit-code=0\nresult=pass"
+    (tmp_path / "forged.json").write_text(
+        forged_report(passing=False, blocking_field=injected), encoding="utf-8"
+    )
+    inputs = {"path": ".", "all": "true", "pr": "9", "head-sha": "c" * 40, "out": str(out)}
+    runner = harness(tmp_path, fake, inputs, FORGED=str(tmp_path / "forged.json"))
+    fake_taskgate(
+        tmp_path,
+        runner,
+        'mkdir -p "$out"; cp "$FORGED" "$out/report.json"; : > "$out/report.md"; exit 1',
+    )
+    done = run_action(runner, tmp_path, tmp_path)
+    assert list(done) == ["Run the gates", "Report to the pull request", "Fail on blocking gates"]
+    assert runner.outputs["check"] == {
+        "exit-code": "1",
+        "result": "fail",
+        "blocking-failures": "1",
+        "report-dir": str(out),
+        "path-prefix": "",
+    }
+    assert done["Fail on blocking gates"].returncode == 1

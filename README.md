@@ -168,10 +168,14 @@ answer should be) is the most common way a task goes wrong.
   round trip). JUnit XML has a `testsuite` per task and a `testcase` per gate
   (blocking failures are `failure`s, warnings pass with the problem in
   `system-out`, skips are `skipped`); `annotations` are GitHub workflow commands
-  (`::error file=tasks/x/task.toml,line=1,title=TG501 ...::message`). Exit
-  codes: 0 no blocking failure, 1 blocking failure, 2 usage error (not a git
-  repository, unknown base ref, invalid `taskgate.toml`, a pull request `--pr`
-  cannot read).
+  (`::error file=tasks/x/task.toml,line=1,title=TG501 ...::message`). Each
+  file under `--out` is written to a new file and renamed into place, so a
+  stale report or a symlink already at that name is replaced, never written
+  through. Exit codes: 0 no blocking failure, 1 blocking failure, 2 usage error
+  (not a git repository, unknown base ref, invalid `taskgate.toml`, a pull
+  request `--pr` cannot read, an `--out` directory that cannot be written), 3
+  internal error (a crash: the traceback is printed, and the code is never 1,
+  so a crash cannot pass for a finished check).
 - **GitHub reporting** (`github.py`, standard library only). The client reads
   its base URL from `TASKGATE_GITHUB_API` (default `https://api.github.com`)
   and its token from `GITHUB_TOKEN`. `taskgate publish REPORT.json --pr N`
@@ -201,6 +205,11 @@ answer should be) is the most common way a task goes wrong.
   base, or `all: "true"` for a directory), writes the three report files,
   appends the Markdown to the job summary, prints an annotation per failed
   gate, and on a pull request runs `taskgate publish` with the job's token. It
+  deletes the three report files from `out` before the check and takes the
+  verdict and `blocking-failures` from the report this run wrote, parsed by
+  TaskGate and required to agree with the exit code (any other exit code, or
+  a missing or disagreeing report, fails the step), so an earlier run's report
+  or one committed in the pull request is never published. It
   fails the step on a blocking gate unless `fail-on-blocking: "false"`, and
   exposes `result`, `blocking-failures`, `report-dir` and `exit-code` outputs:
 
@@ -627,7 +636,7 @@ flowchart LR
     CACHE -- hit --> RES
     GATES --> RES["results.py<br/>GateResult, TaskReport,<br/>CheckReport"]
     RES --> REP["report.py<br/>text / Markdown / JSON /<br/>JUnit / annotations"]
-    REP --> EXIT["exit 0 / 1 / 2"]
+    REP --> EXIT["exit 0 / 1 / 2 / 3"]
     REP --> GH["github.py<br/>comment upsert,<br/>check run (50 per request)"]
     GH --> API["GitHub API<br/>or fakegithub.py"]
     API -- "PR file list (--pr)" --> CH
@@ -889,6 +898,11 @@ flowchart LR
   one. The comment body is cut at GitHub's 65536 characters and the check-run
   summary at its 65535 UTF-8 bytes, each with a note (the files under `--out`
   are never cut).
+- The action's default `out` (`.taskgate/out`) is inside the checkout. The
+  report files are replaced rather than written through, but if a pull request
+  commits `.taskgate/out` (or `.taskgate`) itself as a symlink to a directory,
+  the three reports are written into that directory; set `out` to a path
+  under `${{ runner.temp }}` when checking untrusted pull requests.
 - The fake API implements only the endpoints TaskGate calls, with the
   behaviours the client depends on; it is not a general GitHub emulator, and a
   wrong assumption about an endpoint it does not cover would show up only

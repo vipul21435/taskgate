@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
+import sys
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -127,6 +130,10 @@ RENDERERS: dict[OutputFormat, Callable[[CheckReport], str]] = {
 }
 REPORT_FILES = {"report.md": to_markdown, "report.json": to_json, "junit.xml": to_junit}
 """What ``check --out DIR`` writes."""
+
+INTERNAL_ERROR = 3
+"""The exit code of a crash (an exception TaskGate did not expect), kept apart from 1
+(a blocking failure) so a crash is never read as a finished check."""
 
 
 def _fail_usage(message: str) -> typer.Exit:
@@ -405,8 +412,9 @@ def check(
     A task whose content, TaskGate build, gates, config and runner match an
     earlier passing run is not checked again: its results come from the cache
     and reports mark it cached. --out writes report.md, report.json and
-    junit.xml. Exits 0 when no blocking gate fails, 1 when one does, and 2 on
-    usage errors (including a GitHub API that --pr cannot read).
+    junit.xml. Exits 0 when no blocking gate fails, 1 when one does, 2 on
+    usage errors (including a GitHub API that --pr cannot read) and 3 when
+    TaskGate itself crashed.
     """
     cache = CacheSettings(off=no_cache, directory=cache_dir)
     if all_tasks and pr is not None:
@@ -419,13 +427,34 @@ def check(
     )
     typer.echo(RENDERERS[output_format](report), nl=False)
     if out is not None:
-        out.mkdir(parents=True, exist_ok=True)
-        for name, render in REPORT_FILES.items():
-            (out / name).write_text(render(report), encoding="utf-8")
+        _write_reports(out, report)
         written = [str(out / name) for name in REPORT_FILES]
         typer.echo(f"wrote {', '.join(written[:-1])} and {written[-1]}", err=True)
     if not report.passed:
         raise typer.Exit(1)
+
+
+def _write_reports(out: Path, report: CheckReport) -> None:
+    """Write :data:`REPORT_FILES` under ``out``, each to a new file renamed over its name.
+
+    Whatever sits at a report's name already (a stale report, or a symlink committed
+    in the checked pull request) is replaced, never written through. A directory
+    that cannot be written is a usage error (exit 2), not a crash.
+    """
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        for name, render in REPORT_FILES.items():
+            text = render(report)
+            tmp = out / f".{name}.{secrets.token_hex(8)}.tmp"
+            try:
+                with tmp.open("x", encoding="utf-8") as handle:
+                    handle.write(text)
+                tmp.replace(out / name)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
+    except OSError as exc:
+        raise _fail_usage(f"cannot write the reports under {out}: {exc}") from exc
 
 
 def _load_report(path: Path) -> CheckReport:
@@ -785,5 +814,15 @@ def cache_prune(
 
 
 def main() -> None:
-    """Console-script entry point."""
-    app()
+    """Console-script entry point. A crash prints its traceback and exits
+    :data:`INTERNAL_ERROR`, never 1, which means a blocking gate failed."""
+    try:
+        app()
+    except Exception:
+        traceback.print_exc()
+        typer.echo(
+            "error: internal error (a bug in TaskGate, not a verdict on the tasks); "
+            f"exit code {INTERNAL_ERROR}",
+            err=True,
+        )
+        sys.exit(INTERNAL_ERROR)

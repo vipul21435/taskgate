@@ -11,7 +11,7 @@ from fakedocker import FakeDocker
 from gitrepo import GitRepo
 from taskfactory import GRADER, LENIENT_GRADER
 from taskfactory import make_task as make_runnable_task
-from taskgate import __version__, registry
+from taskgate import __version__, cli, registry
 from taskgate.cli import app
 from taskgate.gates import BUILTIN_GATES
 from taskgate.registry import ENTRY_POINT_GROUP
@@ -118,6 +118,65 @@ def test_check_passes_a_good_pull_request(repo: GitRepo, tmp_path: Path) -> None
     assert data["result"] == "pass"
     assert [task["path"] for task in data["tasks"]] == ["tasks/echo"]
     assert (out / "report.md").read_text(encoding="utf-8").startswith("## TaskGate: PASS")
+
+
+def test_check_out_replaces_symlinks_instead_of_writing_through_them(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    pr_repo(repo)
+    out = tmp_path / "out"
+    out.mkdir()
+    elsewhere = tmp_path / "elsewhere.md"
+    elsewhere.write_text("not a report\n", encoding="utf-8")
+    (out / "report.md").symlink_to(elsewhere)
+    (out / "junit.xml").symlink_to(tmp_path / "missing" / "junit.xml")
+    result = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--out", str(out)])
+    assert result.exit_code == 0, result.output
+    assert elsewhere.read_text(encoding="utf-8") == "not a report\n"
+    assert not (tmp_path / "missing").exists()
+    assert sorted(p.name for p in out.iterdir()) == ["junit.xml", "report.json", "report.md"]
+    assert not any(p.is_symlink() for p in out.iterdir())
+    assert (out / "report.md").read_text(encoding="utf-8").startswith("## TaskGate: PASS")
+
+
+def test_check_out_that_cannot_be_written_is_an_error_not_a_crash(
+    repo: GitRepo, tmp_path: Path
+) -> None:
+    pr_repo(repo)
+    out = tmp_path / "out"
+    (out / "report.json").mkdir(parents=True)
+    result = runner.invoke(app, ["check", str(repo.root), "--base", "main", "--out", str(out)])
+    assert result.exit_code == 2, result.output
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert f"error: cannot write the reports under {out}: " in result.stderr
+    assert sorted(p.name for p in out.iterdir()) == ["report.json", "report.md"]
+    assert (out / "report.json").is_dir()
+    not_a_directory = tmp_path / "file"
+    not_a_directory.write_text("x\n", encoding="utf-8")
+    result = runner.invoke(
+        app, ["check", str(repo.root), "--base", "main", "--out", str(not_a_directory)]
+    )
+    assert result.exit_code == 2, result.output
+    assert f"error: cannot write the reports under {not_a_directory}: " in result.stderr
+
+
+def test_a_crash_exits_3_so_it_is_never_taken_for_a_verdict(
+    repo: GitRepo, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def crash(*args: object) -> None:
+        raise RuntimeError("an unexpected state")
+
+    pr_repo(repo)
+    monkeypatch.setattr(cli, "_check_diff", crash)
+    monkeypatch.setattr(sys, "argv", ["taskgate", "check", str(repo.root), "--base", "main"])
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 3
+    err = capsys.readouterr().err
+    assert "RuntimeError: an unexpected state" in err
+    assert err.endswith(
+        "error: internal error (a bug in TaskGate, not a verdict on the tasks); exit code 3\n"
+    )
 
 
 def test_check_blocks_a_lenient_grader(repo: GitRepo) -> None:

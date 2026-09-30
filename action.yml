@@ -123,12 +123,33 @@ runs:
           fi
         fi
         if [ -n "$INPUT_CONFIG" ]; then args+=(--config "$INPUT_CONFIG"); fi
+        # Reports already in the output directory (an earlier run's, or files the
+        # pull request committed there) must never pass for this run's.
+        rm -f "$INPUT_OUT/report.json" "$INPUT_OUT/report.md" "$INPUT_OUT/junit.xml"
         set +e
         "$TASKGATE" "${args[@]}"
         code=$?
         set -e
+        # 0 pass, 1 blocking failure; 2 (usage error) and 3 (crash) fail the step.
         if [ "$code" -gt 1 ]; then exit "$code"; fi
-        blocking=$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["blocking_failures"])' "$INPUT_OUT/report.json")
+        # The count comes from the report this run wrote, parsed by TaskGate (so it is
+        # an integer), and its verdict must agree with the exit code.
+        blocking=$("$PYTHON" - "$INPUT_OUT/report.json" "$code" <<'PY'
+        import sys
+        from pathlib import Path
+
+        from taskgate.report import from_json
+
+        path, code = Path(sys.argv[1]), int(sys.argv[2])
+        try:
+            report = from_json(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            sys.exit(f"error: taskgate check exited {code} without a readable {path}: {exc}")
+        if report.passed != (code == 0):
+            sys.exit(f"error: {path} disagrees with exit code {code}")
+        print(report.blocking_failures)
+        PY
+        )
         {
           echo "exit-code=$code"
           echo "result=$([ "$code" -eq 0 ] && echo pass || echo fail)"
