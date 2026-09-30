@@ -663,6 +663,7 @@ flowchart LR
 | Image sizes | `docker image ls taskgate`, `docker image ls taskgate-env` | TaskGate image 473 MB (python:3.12-slim plus git); each sample task image 235 MB |
 | Reports, macOS vs image | `cmp` of each demo `report.md`, `report.json` and `junit.xml` (four pull requests plus the `--pr 4` run) | all 15 byte-identical, TG501's shuffled reruns included |
 | Check-run batching | `tests/test_github.py` against the fake, which answers 422 to 51 annotations like GitHub | 120 annotations sent as 50 + 50 + 20 in 3 requests; 0 annotations in 1 request |
+| Composite action in CI | `gh run view` of the `action` job (run 36654517165) | 27 s for two runs of `uses: ./` on the sample tasks with the Docker runner, the second one cached; the fake recorded one comment created then updated and two check runs |
 | Image tags, macOS vs CI | TG301 messages of `make demo-docker` locally and in the CI log | the same four tags (`taskgate-env:8c498462f77c4f11`, `...13e3d22e858b2e52`, `...d98b9b87a032cdee`, `...4c55c370265970c9`), and the same TG501 flips |
 | Secret-scan false positives | `uv run python examples/secret_survey.py scan .venv/lib/python3.12/site-packages` | 0 findings in 2523 text files, 689,539 lines of the locked dependencies (macOS arm64), 4.3 s |
 | Secret-scan recall | `uv run python examples/secret_survey.py recall` | 2000 seeded random base64 tokens per length: 24 chars 0.8905, 32 chars 0.9665, 40 chars 0.9720, 64 chars 0.9975 |
@@ -720,9 +721,10 @@ flowchart LR
   PATH (`tests/fake_docker_cli.py`) records every argv, emulates builds and image
   inspection, and runs the real in-container driver script on the host, so the
   flags, the tar stream, the step markers, timeouts and the created-file listing
-  are all covered without a daemon. Four opt-in tests (`make test-docker`)
+  are all covered without a daemon. Eight opt-in tests (`make test-docker`)
   check the same paths against real Docker, including that a container sees no
-  network, a non-root uid, `memory.max` and `pids.max`.
+  network, a non-root uid, `memory.max` and `pids.max`, and that TG501's
+  reruns survive a root-owned workdir and keep every mode bit and mtime.
 - **Determinism is checked against identical inputs.** TG501 grades one
   solution output five times rather than rerunning the solution, so a flip is
   the grader's alone. Every rerun sees that output exactly: `snapshot.py`
