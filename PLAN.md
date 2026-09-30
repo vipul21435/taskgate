@@ -293,6 +293,54 @@ passes the same review gates before it is accepted.
   - `taskgate grade` checks for `solution/solve.sh` and `tests/` and exits 2
     (usage error) instead of a traceback.
 
+- **Slice 5 decisions (2026-09-30):**
+  - The GitHub client is `urllib` only (no HTTP dependency): three operations,
+    each in the fewest calls the API allows. The pull-request file list follows
+    the `Link` header at 100 per page and first reads the pull request's
+    `changed_files`, so a list the API truncated at 3000 files is an error
+    rather than a silently partial check. Pagination links to another host are
+    refused and the token is sent only to `TASKGATE_GITHUB_API`.
+  - One summary comment per pull request, found by a hidden HTML marker at the
+    start of its body: updated when the Markdown changed, left alone when not
+    (no write), created otherwise. Byte-stable reports make "unchanged" a plain
+    string comparison. A check run is created per `publish` (GitHub shows the
+    latest per name and commit); its summary is the Markdown report and its
+    annotations go 50 per request (create, then update calls), which the fake
+    enforces with a 422 like GitHub does.
+  - Annotations land on line 1 of each task's `task.toml` for every gate:
+    results carry no locations, and inventing them from message text would be
+    guesswork. Listed as a known issue and the first roadmap item.
+  - `publish` is a separate command from `check` (reads `report.json`, needs
+    the token), so the action can check without a token and a report can be
+    posted again later. `report.json` therefore reads back into the same
+    `CheckReport` (`from_json`, round trip tested), and `taskgate report`
+    renders a saved report in any format, which is how the action prints
+    annotations. `--out` now also writes `junit.xml` (no `time` attributes,
+    blocking failures as `failure`, warnings in `system-out`).
+  - `check --pr N` replaces `git diff` with the pull request's file list (both
+    sides of a rename) and reports `files of pull request #N` in the header
+    and `pull_request` in JSON; task roots and the merge base still come from
+    git, so it does not remove the need for history. Kept optional (`pr-files`
+    off by default in the action).
+  - The fake (`src/taskgate/fakegithub.py`) is part of the package, stdlib
+    only and Python 3.9+, so `make demo` in the image and a CI step with the
+    system Python can start it (`python -m taskgate.fakegithub --port N`,
+    `GET /_fake/state` for inspection). It serves from a thread on
+    `127.0.0.1:0` in tests; `html_url` values use a fixed host so demo output
+    does not depend on the port. An `RLock` guards its state because the
+    handler calls `snapshot()` under the lock.
+  - The composite action installs from the lock file (`uv sync --locked
+    --no-dev --project $GITHUB_ACTION_PATH`) and passes every input through
+    `env:` rather than interpolating `${{ inputs.* }}` into scripts. The check
+    step turns exit 1 into outputs (usage errors still fail it) and a final
+    step fails the job unless `fail-on-blocking: "false"`. A test parses
+    `action.yml` and runs its `run:` steps in bash against the fake, so the
+    scripts are checked before CI; the CI `action` job runs `uses: ./` twice
+    on the sample tasks against a fake started in the job and asserts one
+    comment (updated, not duplicated), two check runs and the annotation path.
+  - Docker-runner and local-runner demo reports plus the `--pr 4` run are 15
+    files, byte-identical between macOS and the image.
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
@@ -365,7 +413,9 @@ passes the same review gates before it is accepted.
   cached; `--no-cache`, `taskgate cache stats` and `taskgate cache prune`. Tests
   prove the hash ignores mtimes and walk order and changes on any byte or mode
   change.
-- [ ] **5. GitHub reporting, fake API and composite action.** A stdlib GitHub
+- [x] **5. GitHub reporting, fake API and composite action.** Done 2026-09-30:
+  524 tests (plus 8 opt-in real-Docker tests), 100% branch coverage; `make demo`
+  8.08 to 8.38 s including the GitHub part. A stdlib GitHub
   client (base URL from `TASKGATE_GITHUB_API`, token from `GITHUB_TOKEN`) that
   lists pull-request files, upserts a single summary comment by hidden marker and
   creates a check run with annotations in batches of 50; a JUnit XML report and

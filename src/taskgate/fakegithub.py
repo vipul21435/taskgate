@@ -18,8 +18,8 @@ requests, comments and check runs as JSON, so a process that did not start the
 fake (a CI step running the composite action) can inspect it.
 
 Run ``python -m taskgate.fakegithub --port 8765`` to serve until interrupted. The
-module imports nothing outside the standard library, so ``PYTHONPATH=src`` is
-enough to start it.
+module imports nothing outside the standard library and runs on Python 3.9 and
+later, so ``PYTHONPATH=src`` with a system Python is enough to start it.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ ANNOTATION_LIMIT = 50
 MAX_PER_PAGE = 100
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True)
 class Recorded:
     """One request the fake received."""
 

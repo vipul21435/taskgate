@@ -1,0 +1,171 @@
+name: TaskGate
+description: Review gates for pull requests that add or change benchmark tasks for AI coding agents.
+author: Vipul Raj Jha
+branding:
+  icon: check-square
+  color: green
+
+# Runs `taskgate check` on the checked-out repository, writes report.md,
+# report.json and junit.xml, appends the Markdown report to the job summary,
+# emits an annotation per failed gate, and on a pull request keeps one summary
+# comment up to date and creates a check run (annotations 50 per request).
+# Check out with `fetch-depth: 0` so the base branch's history is available.
+
+inputs:
+  path:
+    description: Repository to check (diff mode) or, with `all`, the directory whose tasks to check.
+    default: "."
+  base:
+    description: Base ref to diff against. Default on pull_request events is origin/<base branch>, otherwise origin/main, then main.
+    default: ""
+  all:
+    description: Check every task under `path` instead of the ones the pull request changed ("true" or "false").
+    default: "false"
+  runner:
+    description: Where solutions and graders run - auto (Docker when it answers), docker or local.
+    default: auto
+  config:
+    description: A taskgate.toml to use instead of the one committed at the base ref (or in the checked directory).
+    default: ""
+  out:
+    description: Directory for report.md, report.json and junit.xml.
+    default: .taskgate/out
+  pr-files:
+    description: Take the changed files from the pull request's file list (GitHub API) instead of git diff ("true" or "false").
+    default: "false"
+  pr:
+    description: Pull request to report to. Empty means no comment and no check run.
+    default: ${{ github.event.pull_request.number }}
+  head-sha:
+    description: Commit the check run is attached to.
+    default: ${{ github.event.pull_request.head.sha || github.sha }}
+  comment:
+    description: Create or update the summary comment on the pull request ("true" or "false").
+    default: "true"
+  check-run:
+    description: Create a check run with an annotation per failed gate ("true" or "false").
+    default: "true"
+  check-name:
+    description: Name of the check run.
+    default: TaskGate
+  github-token:
+    description: Token for the pull-request file list, the comment and the check run (needs pull-requests write and checks write).
+    default: ${{ github.token }}
+  github-api:
+    description: Base URL of the GitHub REST API.
+    default: ${{ github.api_url }}
+  path-prefix:
+    description: Prepended to task paths in annotations. Default - `path` when `all` is "true", else nothing.
+    default: ""
+  fail-on-blocking:
+    description: Fail the step when a blocking gate fails ("true" or "false"). Usage errors always fail it.
+    default: "true"
+
+outputs:
+  result:
+    description: pass or fail.
+    value: ${{ steps.check.outputs.result }}
+  blocking-failures:
+    description: How many blocking gates failed.
+    value: ${{ steps.check.outputs.blocking-failures }}
+  report-dir:
+    description: The directory holding report.md, report.json and junit.xml.
+    value: ${{ steps.check.outputs.report-dir }}
+  exit-code:
+    description: taskgate check's exit code (0 pass, 1 blocking failure).
+    value: ${{ steps.check.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up uv
+      uses: astral-sh/setup-uv@v10.2.0
+      with:
+        version: "0.11.29"
+        python-version: "3.12"
+
+    - name: Install TaskGate from its lock file
+      shell: bash
+      env:
+        UV_PROJECT_ENVIRONMENT: ${{ github.action_path }}/.venv
+      run: uv sync --locked --no-dev --project "$GITHUB_ACTION_PATH"
+
+    - name: Run the gates
+      id: check
+      shell: bash
+      env:
+        TASKGATE: ${{ github.action_path }}/.venv/bin/taskgate
+        PYTHON: ${{ github.action_path }}/.venv/bin/python
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_BASE: ${{ inputs.base }}
+        INPUT_ALL: ${{ inputs.all }}
+        INPUT_RUNNER: ${{ inputs.runner }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_OUT: ${{ inputs.out }}
+        INPUT_PR_FILES: ${{ inputs.pr-files }}
+        INPUT_PR: ${{ inputs.pr }}
+        INPUT_PATH_PREFIX: ${{ inputs.path-prefix }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        TASKGATE_GITHUB_API: ${{ inputs.github-api }}
+      run: |
+        set -euo pipefail
+        args=(check "$INPUT_PATH" --out "$INPUT_OUT" --runner "$INPUT_RUNNER")
+        prefix="$INPUT_PATH_PREFIX"
+        if [ "$INPUT_ALL" = true ]; then
+          args+=(--all)
+          if [ -z "$prefix" ] && [ "$INPUT_PATH" != . ]; then prefix="$INPUT_PATH"; fi
+        else
+          base="$INPUT_BASE"
+          if [ -z "$base" ] && [ -n "${GITHUB_BASE_REF:-}" ]; then base="origin/$GITHUB_BASE_REF"; fi
+          if [ -n "$base" ]; then args+=(--base "$base"); fi
+          if [ "$INPUT_PR_FILES" = true ] && [ -n "$INPUT_PR" ]; then
+            args+=(--pr "$INPUT_PR" --repo "$GITHUB_REPOSITORY")
+          fi
+        fi
+        if [ -n "$INPUT_CONFIG" ]; then args+=(--config "$INPUT_CONFIG"); fi
+        set +e
+        "$TASKGATE" "${args[@]}"
+        code=$?
+        set -e
+        if [ "$code" -gt 1 ]; then exit "$code"; fi
+        blocking=$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["blocking_failures"])' "$INPUT_OUT/report.json")
+        {
+          echo "exit-code=$code"
+          echo "result=$([ "$code" -eq 0 ] && echo pass || echo fail)"
+          echo "blocking-failures=$blocking"
+          echo "report-dir=$INPUT_OUT"
+          echo "path-prefix=$prefix"
+        } >> "$GITHUB_OUTPUT"
+        cat "$INPUT_OUT/report.md" >> "$GITHUB_STEP_SUMMARY"
+        "$TASKGATE" report "$INPUT_OUT/report.json" --format annotations --path-prefix "$prefix"
+
+    - name: Report to the pull request
+      if: ${{ inputs.pr != '' && (inputs.comment == 'true' || inputs.check-run == 'true') }}
+      shell: bash
+      env:
+        TASKGATE: ${{ github.action_path }}/.venv/bin/taskgate
+        INPUT_OUT: ${{ inputs.out }}
+        INPUT_PR: ${{ inputs.pr }}
+        INPUT_HEAD_SHA: ${{ inputs.head-sha }}
+        INPUT_COMMENT: ${{ inputs.comment }}
+        INPUT_CHECK_RUN: ${{ inputs.check-run }}
+        INPUT_CHECK_NAME: ${{ inputs.check-name }}
+        PREFIX: ${{ steps.check.outputs.path-prefix }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        TASKGATE_GITHUB_API: ${{ inputs.github-api }}
+      run: |
+        set -euo pipefail
+        args=(publish "$INPUT_OUT/report.json" --pr "$INPUT_PR" --repo "$GITHUB_REPOSITORY"
+              --check-name "$INPUT_CHECK_NAME" --path-prefix "$PREFIX")
+        if [ "$INPUT_COMMENT" != true ]; then args+=(--no-comment); fi
+        if [ "$INPUT_CHECK_RUN" = true ]; then args+=(--sha "$INPUT_HEAD_SHA"); else args+=(--no-check-run); fi
+        "$TASKGATE" "${args[@]}"
+
+    - name: Fail on blocking gates
+      if: ${{ inputs.fail-on-blocking == 'true' && steps.check.outputs.exit-code == '1' }}
+      shell: bash
+      env:
+        BLOCKING: ${{ steps.check.outputs.blocking-failures }}
+      run: |
+        echo "TaskGate: $BLOCKING blocking gate failure(s); see the job summary and the annotations" >&2
+        exit 1

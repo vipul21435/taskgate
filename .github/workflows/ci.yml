@@ -68,3 +68,79 @@ jobs:
         run: cat .taskgate/demo-docker/out/pr/*/report.md >> "$GITHUB_STEP_SUMMARY"
       - name: Opt-in tests against the real Docker daemon
         run: make test-docker
+
+  action:
+    name: composite action on the sample tasks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Start a fake GitHub API for the action to report to
+        run: |
+          PYTHONPATH=src nohup python3 -m taskgate.fakegithub --port 8765 --repo "$GITHUB_REPOSITORY" > fake-github.log 2>&1 &
+          for _ in $(seq 1 40); do
+            curl -fs http://127.0.0.1:8765/_fake/state > /dev/null && break
+            sleep 0.5
+          done
+          cat fake-github.log
+      - name: TaskGate on every bundled sample task (the draft must be blocked, the action must not fail)
+        id: taskgate
+        uses: ./
+        with:
+          path: examples/sample-repo
+          all: "true"
+          fail-on-blocking: "false"
+          pr: "1"
+          head-sha: ${{ github.sha }}
+          github-api: http://127.0.0.1:8765
+          github-token: fake-token
+      - name: TaskGate again (the complete task comes from the cache, the comment is updated in place)
+        id: again
+        uses: ./
+        with:
+          path: examples/sample-repo
+          all: "true"
+          fail-on-blocking: "false"
+          pr: "1"
+          head-sha: ${{ github.sha }}
+          github-api: http://127.0.0.1:8765
+          github-token: fake-token
+      - name: Check the outputs and what reached the fake API
+        env:
+          RESULT: ${{ steps.taskgate.outputs.result }}
+          BLOCKING: ${{ steps.taskgate.outputs.blocking-failures }}
+          REPORT_DIR: ${{ steps.taskgate.outputs.report-dir }}
+          AGAIN: ${{ steps.again.outputs.result }}
+        run: |
+          test "$RESULT" = fail
+          test "$BLOCKING" = 1
+          test "$AGAIN" = fail
+          test -s "$REPORT_DIR/junit.xml"
+          grep -q "(cached)" "$REPORT_DIR/report.md"
+          curl -fs http://127.0.0.1:8765/_fake/state > fake-state.json
+          python3 - <<'PY'
+          import json
+          state = json.load(open("fake-state.json"))
+          requests = [(r["method"], r["path"].split("/")[-1], r["status"]) for r in state["requests"]]
+          print("\n".join(f"{m} .../{p} -> {s}" for m, p, s in requests))
+          comments = state["comments"]["1"]
+          assert len(comments) == 1, comments
+          assert comments[0]["body"].startswith("<!-- taskgate:summary -->\n## TaskGate: FAIL\n")
+          assert [r["conclusion"] for r in state["check_runs"]] == ["failure", "failure"]
+          notes = state["check_runs"][0]["output"]["annotations"]
+          assert [n["path"] for n in notes] == ["examples/sample-repo/tasks/word-count-draft/task.toml"], notes
+          assert ("PATCH", "1", 200) in requests, "the second run must update the comment, not add one"
+          print("ok: one comment, updated once; two check runs with one annotation each")
+          PY
+      - name: The action must fail the job on a blocking gate by default
+        id: strict
+        uses: ./
+        continue-on-error: true
+        with:
+          path: examples/sample-repo
+          all: "true"
+          comment: "false"
+          check-run: "false"
+      - name: Confirm the strict run failed
+        env:
+          OUTCOME: ${{ steps.strict.outcome }}
+        run: test "$OUTCOME" = failure

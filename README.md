@@ -9,11 +9,14 @@ secrets, file sizes and binaries, the environment builds from a digest-pinned
 base, the reference solution must pass, an untouched workspace and an
 empty-output stub must fail, and the grader must give the same per-test
 outcomes when rerun with a shuffled test order and new seeds), and reports the
-result as terminal text, a Markdown pull-request summary and JSON, with a
-non-zero exit when a blocking gate fails. Solutions and graders run in the task's own Docker image with no
-network and resource limits, or in a local temporary directory when Docker is
-not available. Results are cached by a content hash of the task, so a task
-that has not changed since it last passed is not checked again.
+result as terminal text, a Markdown pull-request summary, JSON, JUnit XML and
+GitHub annotations, with a non-zero exit when a blocking gate fails. On GitHub
+it keeps one summary comment per pull request up to date and creates a check
+run with an annotation per failed gate, through a composite action or the
+`taskgate publish` command. Solutions and graders run in the task's own Docker
+image with no network and resource limits, or in a local temporary directory
+when Docker is not available. Results are cached by a content hash of the
+task, so a task that has not changed since it last passed is not checked again.
 
 It mirrors the submission side of benchmark-task work at an AI-data company:
 every task has to clear the same review gates before it is accepted, and a
@@ -151,10 +154,68 @@ answer should be) is the most common way a task goes wrong.
   global `ARG` substitution (`$V`, `${V}`, `${V:-x}`, `${V:+x}`, defaults that
   use earlier `ARG`s), used by TG301 and TG302. The images it lists for TG302
   include the `from=` of `RUN --mount`, which BuildKit pulls like a base image.
-- **Reports**: text on stdout (or `--format markdown|json`), plus `report.md` and
-  `report.json` under `--out DIR`. Exit codes: 0 no blocking failure, 1 blocking
-  failure, 2 usage error (not a git repository, unknown base ref, invalid
-  `taskgate.toml`).
+- **Reports**: text on stdout (or `--format markdown|json|junit|annotations`),
+  plus `report.md`, `report.json` and `junit.xml` under `--out DIR`;
+  `taskgate report REPORT.json --format ...` renders a saved report again, and
+  `report.json` reads back into the same report object (a test checks the
+  round trip). JUnit XML has a `testsuite` per task and a `testcase` per gate
+  (blocking failures are `failure`s, warnings pass with the problem in
+  `system-out`, skips are `skipped`); `annotations` are GitHub workflow commands
+  (`::error file=tasks/x/task.toml,line=1,title=TG501 ...::message`). Exit
+  codes: 0 no blocking failure, 1 blocking failure, 2 usage error (not a git
+  repository, unknown base ref, invalid `taskgate.toml`, a pull request `--pr`
+  cannot read).
+- **GitHub reporting** (`github.py`, standard library only). The client reads
+  its base URL from `TASKGATE_GITHUB_API` (default `https://api.github.com`)
+  and its token from `GITHUB_TOKEN`. `taskgate publish REPORT.json --pr N`
+  keeps one summary comment per pull request: the comment whose body starts
+  with a hidden `<!-- taskgate:summary -->` marker is updated when the report
+  changed, left alone when it did not, and created otherwise; it also creates
+  a completed check run (`success` or `failure`) whose summary is the Markdown
+  report and whose annotations, one per failed gate on the task's `task.toml`,
+  are sent 50 per request as the API requires (the first batch with the create
+  call, the rest with updates). `taskgate check --pr N` takes the changed files
+  from the pull request's file list (100 per page, following the `Link`
+  header, and refusing a list the API truncated at 3000 files) instead of
+  `git diff`. The token is sent only to the configured base URL, pagination
+  links to other hosts are refused, and error messages never carry it.
+- **An in-process fake GitHub API** (`fakegithub.py`, standard library only)
+  serves the same endpoints from a thread, records every request, paginates
+  with `Link` headers, answers 401 to a wrong token and 422 to more than 50
+  annotations in one request, as GitHub does. The tests, `make demo` and the
+  CI job that runs the composite action all post to it; `python -m
+  taskgate.fakegithub --port 8765` serves it to another process and
+  `GET /_fake/state` returns what it recorded.
+- **A composite GitHub Action** (`action.yml`). It installs TaskGate from its
+  lock file with uv, runs `taskgate check` (diff against the pull request's
+  base, or `all: "true"` for a directory), writes the three report files,
+  appends the Markdown to the job summary, prints an annotation per failed
+  gate, and on a pull request runs `taskgate publish` with the job's token. It
+  fails the step on a blocking gate unless `fail-on-blocking: "false"`, and
+  exposes `result`, `blocking-failures`, `report-dir` and `exit-code` outputs:
+
+  ```yaml
+  on: pull_request
+  permissions:
+    contents: read
+    pull-requests: write   # the summary comment
+    checks: write          # the check run and its annotations
+  jobs:
+    taskgate:
+      runs-on: ubuntu-latest
+      steps:
+        - uses: actions/checkout@v7
+          with:
+            fetch-depth: 0   # the base branch's history, for the merge base
+        - uses: vipul21435/taskgate@main
+  ```
+
+  Inputs: `path`, `base`, `all`, `runner`, `config`, `out`, `pr-files` (take
+  the changed files from the pull request), `pr`, `head-sha`, `comment`,
+  `check-run`, `check-name`, `github-token`, `github-api`, `path-prefix` and
+  `fail-on-blocking`. A test runs the action's own shell steps from
+  `action.yml` against the fake API, and the CI job below runs the whole
+  action through `uses: ./`.
 - **A sample repository builder** (`examples/build_sample_repo.py`) that creates
   a git repository with a `main` branch and four pull-request branches: one
   good task and three flawed ones. Commits use fixed authors and dates, so the
@@ -214,7 +275,11 @@ answer should be) is the most common way a task goes wrong.
   and the demo (on the local runner: the image has no Docker CLI), and GitHub
   Actions CI that runs lint, mypy, the tests with a coverage gate and the demo;
   a second job builds the image, runs the demo inside it, then runs the demo on
-  the Docker runner and the opt-in real-Docker tests on the runner's daemon.
+  the Docker runner and the opt-in real-Docker tests on the runner's daemon; a
+  third job starts the fake GitHub API, runs the composite action twice on the
+  bundled sample tasks through `uses: ./` (the draft task is blocked, the
+  second run comes from the cache and updates the comment in place) and checks
+  what reached the fake, then confirms the action fails a job by default.
 
 ## Quickstart
 
@@ -226,9 +291,10 @@ uv run taskgate check --all examples/sample-repo
 ```
 
 Verified from a fresh clone. `make demo` needs no network, Docker or tokens (it
-passes `--runner local` through `TASKGATE_RUNNER`) and took 5.34 to 6.28 s over
-three runs (`time make demo`, 8 GB M-series Mac; 1.95 to 2.00 s before TG501
-added five grader reruns per task). The last command exits 1 on purpose: the
+passes `--runner local` through `TASKGATE_RUNNER`, and its GitHub part talks to
+an in-process fake API on `127.0.0.1`) and took 8.08 to 8.38 s over three runs
+(`time make demo`, 8 GB M-series Mac; 5.72 to 5.87 s before the GitHub part,
+1.95 to 2.00 s before TG501 added five grader reruns per task). The last command exits 1 on purpose: the
 bundled draft task is incomplete. With Docker running, `make demo-docker` runs
 the same four pull requests on the Docker runner (8.4 to 8.7 s with the task
 images already built).
@@ -236,8 +302,12 @@ images already built).
 ## Usage
 
 ```
-taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json] [--config FILE]
-               [--runner auto|docker|local] [--no-cache] [--cache-dir DIR]
+taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json|junit|annotations]
+               [--config FILE] [--runner auto|docker|local] [--no-cache] [--cache-dir DIR]
+               [--pr N --repo OWNER/NAME]
+taskgate publish REPORT.json --pr N [--repo OWNER/NAME] --sha SHA [--no-comment] [--no-check-run]
+                 [--check-name NAME] [--path-prefix DIR]
+taskgate report REPORT.json [--format text|markdown|json|junit|annotations] [--path-prefix DIR]
 taskgate grade TASK --seed N [--runner auto|docker|local] [--config FILE]
 taskgate cache stats [ROOT] [--cache-dir DIR] [--json]
 taskgate cache prune [ROOT] [--cache-dir DIR] [--older-than DAYS] [--all] [--dry-run]
@@ -474,6 +544,59 @@ TG5xx  determinism
 each task's changed files, and a `blocking` flag and a `details` list per gate.
 CI appends the demo reports of both runners to the job summaries.
 
+`junit.xml` for the same branch (the passing gates are `testcase`s with no
+children; the whole file is 28 lines):
+
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<testsuites name="taskgate" tests="14" failures="1" errors="0" skipped="0">
+  <testsuite name="tasks/log-levels" tests="14" failures="1" errors="0" skipped="0">
+    <testcase classname="tasks/log-levels" name="TG101 layout-complete" />
+    ...
+    <testcase classname="tasks/log-levels" name="TG501 grader-deterministic">
+      <failure message="4 of 5 reruns failed; 2 tests flipped: tests/test_outputs.py::test_counts_match, tests/test_outputs.py::test_one_line_per_level" type="error">tests/test_outputs.py::test_counts_match: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner local
+tests/test_outputs.py::test_one_line_per_level: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner local
+fix: Make each test independent of test order, hash order and chance: no state shared between tests, sort sets and dict keys before comparing or printing, and seed any random generator from TASKGATE_SEED. Run the reproduce command from the directory the task paths are relative to.</failure>
+    </testcase>
+  </testsuite>
+</testsuites>
+```
+
+`make demo` ends with the GitHub part (`examples/github_demo.py`): it starts the
+fake API in-process, registers the fourth pull request's file list, checks the
+branch with `--pr 4` (the header then says `files of pull request #4`) and
+publishes the report twice. The second `publish` finds the comment by its marker
+and leaves it alone:
+
+```
+$ taskgate publish .taskgate/demo/out/github/pr-4/report.json --pr 4 --sha 804204f4d05bfba9ea1d3e032db38d3ce38d456d
+comment created: https://github.example/sample/tasks/pull/4#issuecomment-1
+check run failure: 1 annotation in 1 request: https://github.example/sample/tasks/runs/2
+
+$ taskgate publish .taskgate/demo/out/github/pr-4/report.json --pr 4 --sha 804204f4d05bfba9ea1d3e032db38d3ce38d456d --no-check-run
+comment unchanged: https://github.example/sample/tasks/pull/4#issuecomment-1
+
+== requests the fake GitHub API received
+GET /repos/sample/tasks/pulls/4 -> 200
+GET /repos/sample/tasks/pulls/4/files?per_page=100 -> 200
+GET /repos/sample/tasks/issues/4/comments?per_page=100 -> 200
+POST /repos/sample/tasks/issues/4/comments -> 201
+POST /repos/sample/tasks/check-runs -> 201 (1 annotation)
+GET /repos/sample/tasks/issues/4/comments?per_page=100 -> 200
+
+comment 1 starts with: <!-- taskgate:summary -->
+check run 2: failure, title 'TaskGate: FAIL, 1 blocking failure'
+  failure  tasks/log-levels/task.toml:1  TG501 grader-deterministic
+```
+
+The annotation the action prints for the same report, as the workflow command
+GitHub turns into an inline annotation (`taskgate report REPORT.json --format
+annotations`; newlines are `%0A`):
+
+```
+::error file=tasks/log-levels/task.toml,line=1,title=TG501 grader-deterministic::4 of 5 reruns failed; 2 tests flipped: tests/test_outputs.py::test_counts_match, tests/test_outputs.py::test_one_line_per_level%0Atests/test_outputs.py::test_counts_match: failed in runs 1, 2, 3, 4 (seeds 1, 2, 3, 4); passed in run 5 (seed 5); reproduce: taskgate grade tasks/log-levels --seed 1 --runner local%0A...
+```
+
 ## Architecture
 
 ```mermaid
@@ -493,8 +616,12 @@ flowchart LR
     CACHE -- miss --> GATES
     CACHE -- hit --> RES
     GATES --> RES["results.py<br/>GateResult, TaskReport,<br/>CheckReport"]
-    RES --> REP["report.py<br/>text / Markdown / JSON"]
+    RES --> REP["report.py<br/>text / Markdown / JSON /<br/>JUnit / annotations"]
     REP --> EXIT["exit 0 / 1 / 2"]
+    REP --> GH["github.py<br/>comment upsert,<br/>check run (50 per request)"]
+    GH --> API["GitHub API<br/>or fakegithub.py"]
+    API -- "PR file list (--pr)" --> CH
+    ACT["action.yml<br/>composite action"] --> CLI["cli.py check / publish"]
 ```
 
 | Module | Role |
@@ -515,23 +642,27 @@ flowchart LR
 | `config.py` | `taskgate.toml` parsing and validation (every problem at once): gates, `[manifest]`, `[secrets]`, `[files]`, `[runner]`, `[determinism]` |
 | `registry.py` | built-in plus entry-point gates, validated and sorted by code |
 | `engine.py` | `run_gates`: runs gates in code order, skips unmet `requires`, contains gate crashes |
-| `report.py` | pure renderers from a `CheckReport` to text, Markdown and JSON |
-| `cli.py` | Typer commands `check` (with `--runner`, `--no-cache`, `--cache-dir`), `grade`, `cache stats`, `cache prune`, `gates`, `tasks`, `version` |
+| `report.py` | pure renderers from a `CheckReport` to text, Markdown, JSON, JUnit XML and workflow-command annotations; `findings` (one located entry per failed gate) and `from_json` (a `report.json` back into a `CheckReport`) |
+| `github.py` | the stdlib GitHub client: pull-request file list (paginated), one summary comment by marker, check runs with annotations 50 per request |
+| `fakegithub.py` | the in-process, recording fake of those endpoints (tests, `make demo`, the CI action job) |
+| `cli.py` | Typer commands `check` (with `--runner`, `--no-cache`, `--cache-dir`, `--pr`), `publish`, `report`, `grade`, `cache stats`, `cache prune`, `gates`, `tasks`, `version` |
+| `action.yml` | the composite GitHub Action: install from the lock file, `check`, job summary, annotations, `publish`, outputs |
 
 ## Measured
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 463 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2891 statements, 770 branches); gate is 90% |
-| Real-Docker tests | `time make test-docker` | 5 passed in 10.6 s (task images already built), including TG501 in a real container finding the same flips as the local runner; also green on the GitHub Actions runner (13.1 s) |
-| Demo wall time, local runner | `time make demo` | 5.72 to 5.87 s over three runs (four pull requests plus the cached re-check; 1.95 to 2.00 s for three before TG501) |
+| Tests and coverage | `make cov` | 524 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test); 100% line and branch coverage of `src/` (3700 statements, 968 branches); gate is 90% |
+| Real-Docker tests | `time make test-docker` | 8 passed in 16.1 s (task images already built), including TG501 in a real container finding the same flips as the local runner, restoring a root-owned `mkdir -m 777` workdir, keeping mode bits, hard links, pipes and sub-second mtimes across reruns, and capping JUnit XML like the local runner |
+| Demo wall time, local runner | `time make demo` | 8.08 to 8.38 s over three runs (four pull requests, the cached re-check and the GitHub part against the fake API; 5.72 to 5.87 s before the GitHub part, 1.95 to 2.00 s for three pull requests before TG501) |
 | Demo wall time, Docker runner | `time make demo-docker` | 8.76 s on both of two runs with the four task images built |
 | Cache hit vs full check, one task | `time taskgate check <demo repo> --base main` on `pr/1-integer-determinant`, with `--no-cache` and cached (three runs each) | local runner 1.13 to 1.18 s uncached, 0.18 s cached; Docker runner 1.89 to 1.95 s uncached, 0.21 to 0.22 s cached |
 | Cache on the bundled samples | `time taskgate check --all examples/sample-repo --runner local --cache-dir DIR`, first run and three more | 1.06 to 1.10 s, then 0.10 to 0.11 s once the complete task is cached (the incomplete draft fails TG101, so it is never stored) |
-| Demo in the TaskGate image | `time docker run --rm --entrypoint sh taskgate:local examples/demo.sh /tmp/taskgate-demo` | 6.56 to 6.91 s over three runs |
+| Demo in the TaskGate image | `time docker run --rm --entrypoint sh taskgate:local examples/demo.sh /tmp/taskgate-demo` | 9.96 and 10.51 s over two runs (6.56 to 6.91 s before the GitHub part) |
 | TG501 cost | `time taskgate check --all examples/sample-repo --runner local`, with and without `[gates] disable = ["TG501"]` | 1.08 to 1.21 s with it, 0.50 to 0.56 s without (three runs each; one complete task, five grader reruns) |
 | Image sizes | `docker image ls taskgate`, `docker image ls taskgate-env` | TaskGate image 473 MB (python:3.12-slim plus git); each sample task image 235 MB |
-| Reports, macOS vs image | `cmp` of each demo `report.md` and `report.json` (four pull requests) | all eight byte-identical, TG501's shuffled reruns included |
+| Reports, macOS vs image | `cmp` of each demo `report.md`, `report.json` and `junit.xml` (four pull requests plus the `--pr 4` run) | all 15 byte-identical, TG501's shuffled reruns included |
+| Check-run batching | `tests/test_github.py` against the fake, which answers 422 to 51 annotations like GitHub | 120 annotations sent as 50 + 50 + 20 in 3 requests; 0 annotations in 1 request |
 | Image tags, macOS vs CI | TG301 messages of `make demo-docker` locally and in the CI log | the same four tags (`taskgate-env:8c498462f77c4f11`, `...13e3d22e858b2e52`, `...d98b9b87a032cdee`, `...4c55c370265970c9`), and the same TG501 flips |
 | Secret-scan false positives | `uv run python examples/secret_survey.py scan .venv/lib/python3.12/site-packages` | 0 findings in 2523 text files, 689,539 lines of the locked dependencies (macOS arm64), 4.3 s |
 | Secret-scan recall | `uv run python examples/secret_survey.py recall` | 2000 seeded random base64 tokens per length: 24 chars 0.8905, 32 chars 0.9665, 40 chars 0.9720, 64 chars 0.9975 |
@@ -633,7 +764,27 @@ flowchart LR
 - **Byte-stable reports.** Reports hold no timings (pytest durations are stripped
   from summaries) and no absolute paths, and the demo repository has fixed
   commit metadata; a test checks that two independent builds produce identical
-  output.
+  output. The JUnit XML follows the same rule (no `time` attributes), which is
+  also what lets `publish` tell an unchanged report from a changed one by
+  comparing comment bodies.
+- **One comment per pull request, found by a marker.** The summary comment
+  starts with a hidden HTML comment; `publish` updates that comment instead of
+  adding one per push, and skips the API write when the body is unchanged. A
+  check run is created per `publish` (GitHub shows the latest run of a name
+  per commit), with the Markdown report as its summary, so the verdict is in
+  the Checks tab even when comments are off.
+- **Publishing is a separate step from checking.** `check` needs no token and
+  writes `report.json`; `publish` reads it and needs `GITHUB_TOKEN`. The
+  composite action runs them one after the other, so a workflow can check on
+  every push and post only from a job that has `pull-requests: write`, and a
+  report can be posted again later without rerunning the gates.
+- **The GitHub client is stdlib and fakeable.** `urllib` plus a fixed set of
+  headers, so no HTTP dependency; the base URL is an environment variable,
+  so the tests and the demo talk to `fakegithub.py` over real HTTP in the
+  same process, and the CI job that exercises `action.yml` talks to it over
+  a port. The fake enforces the two limits the client is built around (50
+  annotations per request, `Link`-header pagination), so the tests would fail
+  if the client stopped batching or paging.
 - **Fresh repository, MIT.** No existing permissively licensed project was small
   and close enough to build on (see [PLAN.md](PLAN.md)).
 
@@ -703,6 +854,23 @@ flowchart LR
   Inode numbers and change times of recreated entries differ from rerun 1's.
 - `taskgate grade` takes the task path as reports print it, relative to the
   repository root in diff mode, so it must be run from that directory.
+- Annotations sit on line 1 of each task's `task.toml`, whatever file the gate
+  is about: gate results carry no file or line, and TG201's `path:line` is only
+  in its message. Workflow-command annotations are also capped by GitHub at 10
+  per step for each level (the check run carries them all).
+- The GitHub client does not retry: a transient 5xx fails `publish` (exit 1)
+  and the job step can be rerun. A comment by another author that starts with
+  the marker is taken for TaskGate's own; the update then fails with 403.
+- `check --pr` still needs the base branch's history for the merge base and the
+  task roots; it changes where the changed paths come from, not the need for
+  `fetch-depth: 0`. The action's `pr-files` input is off by default.
+- Every `publish` creates a new check run rather than updating the previous
+  one, and the comment body and check-run summary are cut at GitHub's 65536
+  characters with a note (the files under `--out` are never cut).
+- The fake API implements only the endpoints TaskGate calls, with the
+  behaviours the client depends on; it is not a general GitHub emulator, and a
+  wrong assumption about an endpoint it does not cover would show up only
+  against the real API.
 - The high-entropy detector trades recall for precision: it misses about 11% of
   random 24-character tokens and 3% of 32- to 40-character ones (see Measured),
   never flags a token without both letter cases and a digit, and does not look
@@ -714,14 +882,16 @@ flowchart LR
 
 ## Roadmap
 
-Planned in [PLAN.md](PLAN.md). Slices 1 (the gate registry, plugins,
-`taskgate.toml` and the static gates), 2 (the Docker runner, TG301, TG302 and
-TG403), 3 (grader determinism, TG501, and `taskgate grade`) and 4 (the
-content-hash result cache, `taskgate cache`) are built (see above); the rest is
-not built yet:
+Every slice planned in [PLAN.md](PLAN.md) is built: the gate registry, plugins,
+`taskgate.toml` and the static gates; the Docker runner and the environment
+gates; grader determinism and `taskgate grade`; the content-hash result cache;
+and GitHub reporting with the composite action. Not started, and not promised:
 
-1. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
-   XML, a fake GitHub API for tests and the demo, and a composite `action.yml`.
+1. Per-gate file and line locations in results, so annotations land on the
+   Dockerfile line, the test or the secret instead of `task.toml:1`.
+2. Retries with backoff for transient GitHub API errors in `publish`.
+3. Updating the previous check run on a repeat `publish` for the same commit
+   instead of creating a new one.
 
 ## Development
 
@@ -731,7 +901,7 @@ not built yet:
 | `make lint` | `ruff check` and `ruff format --check` |
 | `make typecheck` | `mypy --strict` on `src/` |
 | `make test` / `make cov` | pytest, and pytest with the 90% branch-coverage gate |
-| `make demo` | the offline end-to-end demo described above (local runner, four pull requests, then a cached re-check) |
+| `make demo` | the offline end-to-end demo described above (local runner, four pull requests, a cached re-check, then the GitHub part against the in-process fake API) |
 | `make demo-docker` | the same demo on the Docker runner, then prune this project's dangling images |
 | `make test-docker` | the opt-in tests against a real Docker daemon (`TASKGATE_DOCKER_TESTS=1 uv run pytest -m docker`) |
 | `make clean-images` | remove the `taskgate-env:*` task images the Docker runner built |
