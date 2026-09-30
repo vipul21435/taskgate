@@ -108,6 +108,7 @@ class Runner:
         self.outputs: dict[str, dict[str, str]] = {}
         self.environ = environ
         self.taskgate = str(Path(sys.executable).with_name("taskgate"))
+        self.python = sys.executable
 
     def value(self, expression: str) -> str:
         """Evaluate one ``${{ }}`` expression."""
@@ -140,7 +141,7 @@ class Runner:
     def run(self, step: Step, cwd: Path) -> subprocess.CompletedProcess[str]:
         env = {**self.environ, **{k: self.substitute(v) for k, v in step.env.items()}}
         env["TASKGATE"] = self.taskgate
-        env["PYTHON"] = sys.executable
+        env["PYTHON"] = self.python
         return subprocess.run(
             ["bash", "-c", step.run], cwd=cwd, env=env, capture_output=True, text=True, check=False
         )
@@ -474,6 +475,106 @@ def test_the_blocking_count_comes_from_the_parsed_report_not_its_raw_field(
         "path-prefix": "",
     }
     assert done["Fail on blocking gates"].returncode == 1
+
+
+SHADOW_BODY = (
+    "import os, sys\n"
+    "open(os.path.join(os.getcwd(), 'shadow-ran'), 'w').close()\n"
+    "_out = os.path.dirname(sys.argv[1])\n"
+    "open(os.path.join(_out, 'report.json'), 'w').write({passing!r})\n"
+    "open(os.path.join(_out, 'report.md'), 'w').write('## TaskGate: PASS\\n')\n"
+)
+"""Python the pull request commits: marks that it ran (``shadow-ran`` in the working
+directory, the checkout), then overwrites this run's reports with a passing one
+(``{passing!r}`` is replaced with its JSON)."""
+
+PATHLIB_SHADOW = SHADOW_BODY + (
+    "sys.stdout.write('0\\nexit-code=0\\nresult=pass\\n')\nsys.stdout.flush()\nos._exit(0)\n"
+)
+"""A ``pathlib.py`` at the repository root that hijacks the report validator."""
+
+REPORT_SHADOW = SHADOW_BODY + (
+    "def from_json(text):\n"
+    "    class Forged:\n"
+    "        passed = sys.argv[2] == '0'\n"
+    "        blocking_failures = '0\\nexit-code=0\\nresult=pass'\n"
+    "    return Forged()\n"
+)
+"""A ``taskgate/report.py`` whose ``from_json`` agrees with any exit code and
+returns a count that smuggles extra outputs."""
+
+
+@pytest.mark.parametrize(
+    ("shadows", "out"),
+    [
+        pytest.param({"pathlib.py": PATHLIB_SHADOW}, "runner-temp", id="stdlib-pathlib"),
+        pytest.param(
+            {"taskgate/__init__.py": "", "taskgate/report.py": REPORT_SHADOW},
+            "",
+            id="taskgate-package",
+        ),
+    ],
+)
+def test_python_the_pull_request_commits_never_runs_in_the_report_validator(
+    tmp_path: Path, fake: FakeGitHub, repo: GitRepo, shadows: dict[str, str], out: str
+) -> None:
+    """The validator runs with the checkout as its working directory. Modules the
+    pull request commits at the repository root must not shadow the standard
+    library or TaskGate there, whichever runner ran the gates and wherever
+    ``out`` is (outside the checkout, or the default ``.taskgate/out``)."""
+    pull_request_repo(repo, solve=FAILING_SOLVE)
+    passing = forged_report(passing=True, blocking_field="0")
+    for relative, content in shadows.items():
+        repo.write(relative, content.replace("{passing!r}", repr(passing)))
+    repo.commit("add tasks/broken and Python that forges the verdict")
+    inputs = {"pr": "9", "head-sha": "c" * 40, "runner": "local"}
+    if out:
+        inputs["out"] = str(tmp_path / out / "out")
+    runner = harness(tmp_path, fake, inputs, GITHUB_BASE_REF="main")
+    done = run_action(runner, repo.root, tmp_path)
+    assert not (repo.root / "shadow-ran").exists()
+    assert list(done) == ["Run the gates", "Report to the pull request", "Fail on blocking gates"]
+    check = done["Run the gates"]
+    assert check.returncode == 0, check.stderr
+    assert "FAIL  TG401" in check.stdout
+    report_dir = repo.root / runner.inputs["out"]
+    assert runner.outputs["check"] == {
+        "exit-code": "1",
+        "result": "fail",
+        "blocking-failures": "1",
+        "report-dir": runner.inputs["out"],
+        "path-prefix": "",
+    }
+    assert json.loads((report_dir / "report.json").read_text(encoding="utf-8"))["result"] == "fail"
+    summary = (tmp_path / "summary.md").read_text(encoding="utf-8")
+    assert summary.startswith("## TaskGate: FAIL\n")
+    (run,) = fake.check_runs()
+    assert run["conclusion"] == "failure"
+    (comment,) = fake.comments(9)
+    assert comment["body"].startswith(f"{MARKER}\n## TaskGate: FAIL\n")
+    assert done["Fail on blocking gates"].returncode == 1
+
+
+def test_a_blocking_count_that_is_not_a_number_fails_the_step_and_publishes_nothing(
+    tmp_path: Path, fake: FakeGitHub
+) -> None:
+    """Whatever the validator prints, only digits reach GITHUB_OUTPUT."""
+    out = tmp_path / "out"
+    inputs = {"path": ".", "all": "true", "pr": "9", "head-sha": "c" * 40, "out": str(out)}
+    runner = harness(tmp_path, fake, inputs)
+    fake_taskgate(tmp_path, runner, 'mkdir -p "$out"; : > "$out/report.json"; exit 0')
+    python = tmp_path / "fake-python"
+    python.write_text("#!/bin/sh\nprintf '0\\nexit-code=0\\nresult=pass\\n'\n", encoding="utf-8")
+    python.chmod(0o755)
+    runner.python = str(python)
+    done = run_action(runner, tmp_path, tmp_path)
+    assert list(done) == ["Run the gates"]
+    failed = done["Run the gates"]
+    assert failed.returncode != 0
+    assert "is not a count" in failed.stderr
+    assert "check" not in runner.outputs
+    assert (tmp_path / "summary.md").read_text(encoding="utf-8") == ""
+    assert fake.requests == []
 
 
 class ReadOnlyGitHub(FakeGitHub):

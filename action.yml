@@ -134,9 +134,11 @@ runs:
         set -e
         # 0 pass, 1 blocking failure; 2 (usage error) and 3 (crash) fail the step.
         if [ "$code" -gt 1 ]; then exit "$code"; fi
-        # The count comes from the report this run wrote, parsed by TaskGate (so it is
-        # an integer), and its verdict must agree with the exit code.
-        blocking=$("$PYTHON" - "$INPUT_OUT/report.json" "$code" <<'PY'
+        # The count comes from the report this run wrote, parsed by TaskGate, and its
+        # verdict must agree with the exit code. The working directory is the pull
+        # request's checkout: -I (isolated mode) keeps it off sys.path, so a
+        # pathlib.py or taskgate/ package committed there is never imported.
+        blocking=$("$PYTHON" -I - "$INPUT_OUT/report.json" "$code" <<'PY'
         import sys
         from pathlib import Path
 
@@ -152,6 +154,10 @@ runs:
         print(report.blocking_failures)
         PY
         )
+        if ! [[ "$blocking" =~ ^[0-9]+$ ]]; then
+          echo "error: the blocking-failure count from $INPUT_OUT/report.json is not a count" >&2
+          exit 1
+        fi
         {
           echo "exit-code=$code"
           echo "result=$([ "$code" -eq 0 ] && echo pass || echo fail)"
