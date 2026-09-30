@@ -302,9 +302,9 @@ uv run taskgate check --all examples/sample-repo
 
 Verified from a fresh clone. `make demo` needs no network, Docker or tokens (it
 passes `--runner local` through `TASKGATE_RUNNER`, and its GitHub part talks to
-an in-process fake API on `127.0.0.1`) and took 8.08 to 8.38 s over three runs
-(`time make demo`, 8 GB M-series Mac; 5.72 to 5.87 s before the GitHub part,
-1.95 to 2.00 s before TG501 added five grader reruns per task). The last command exits 1 on purpose: the
+an in-process fake API on `127.0.0.1`) and took 9.53 to 9.93 s over three runs
+in a fresh clone on 2026-09-30 (`time make demo`, 8 GB M-series Mac; 9.01 to
+9.68 s in the working copy the same day). The last command exits 1 on purpose: the
 bundled draft task is incomplete. With Docker running, `make demo-docker` runs
 the same four pull requests on the Docker runner (8.4 to 8.7 s with the task
 images already built).
@@ -662,9 +662,9 @@ flowchart LR
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 524 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test); 100% line and branch coverage of `src/` (3700 statements, 968 branches); gate is 90% |
-| Real-Docker tests | `time make test-docker` | 8 passed in 16.1 s (task images already built), including TG501 in a real container finding the same flips as the local runner, restoring a root-owned `mkdir -m 777` workdir, keeping mode bits, hard links, pipes and sub-second mtimes across reruns, and capping JUnit XML like the local runner |
-| Demo wall time, local runner | `time make demo` | 8.08 to 8.38 s over three runs (four pull requests, the cached re-check and the GitHub part against the fake API; 5.72 to 5.87 s before the GitHub part, 1.95 to 2.00 s for three pull requests before TG501) |
+| Tests and coverage | `make cov` | 544 passed, 9 skipped (the opt-in real-Docker tests and one Linux-only name test) in 120 s; 100% line and branch coverage of `src/` (3913 statements, 1076 branches); gate is 90% |
+| Real-Docker tests | `time make test-docker` | 8 passed in 18.5 s (task images already built), including TG501 in a real container finding the same flips as the local runner, restoring a root-owned `mkdir -m 777` workdir, keeping mode bits, hard links, pipes and sub-second mtimes across reruns, and capping JUnit XML like the local runner |
+| Demo wall time, local runner | `time make demo` | 9.53 to 9.93 s over three runs in a fresh clone and 9.01 to 9.68 s in the working copy (four pull requests, the cached re-check and the GitHub part against the fake API) |
 | Demo wall time, Docker runner | `time make demo-docker` | 8.76 s on both of two runs with the four task images built |
 | Cache hit vs full check, one task | `time taskgate check <demo repo> --base main` on `pr/1-integer-determinant`, with `--no-cache` and cached (three runs each) | local runner 1.13 to 1.18 s uncached, 0.18 s cached; Docker runner 1.89 to 1.95 s uncached, 0.21 to 0.22 s cached |
 | Cache on the bundled samples | `time taskgate check --all examples/sample-repo --runner local --cache-dir DIR`, first run and three more | 1.06 to 1.10 s, then 0.10 to 0.11 s once the complete task is cached (the incomplete draft fails TG101, so it is never stored) |

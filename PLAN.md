@@ -367,6 +367,16 @@ passes the same review gates before it is accepted.
     superseded by the committed gates and is kept only because stashes are
     never dropped by these runs.
 
+- **Refresh (2026-09-30):** `make lint`, `make typecheck` and `make cov`
+  green (544 passed, 9 skipped, 100% line and branch coverage of 3913
+  statements and 1076 branches); `make test-docker` 8 passed; the README
+  quickstart re-run from a fresh clone (`make demo` exits 0 in 9.53 to 9.93 s;
+  `check --all examples/sample-repo` exits 1 on the draft task as documented);
+  CI green on the pushed head. README and delivery numbers updated to these
+  runs. The slice-1 stash `wip from interrupted agent` was compared with the
+  committed `config.py` and `manifest.py` once more, found fully superseded,
+  and dropped (the refresh task allows dropping a stash that is not useful).
+
 ## Scaffold (done)
 
 - [x] uv project, src layout, strict tooling, MIT license
