@@ -12,7 +12,8 @@ outcomes when rerun with a shuffled test order and new seeds), and reports the
 result as terminal text, a Markdown pull-request summary and JSON, with a
 non-zero exit when a blocking gate fails. Solutions and graders run in the task's own Docker image with no
 network and resource limits, or in a local temporary directory when Docker is
-not available.
+not available. Results are cached by a content hash of the task, so a task
+that has not changed since it last passed is not checked again.
 
 It mirrors the submission side of benchmark-task work at an AI-data company:
 every task has to clear the same review gates before it is accepted, and a
@@ -61,6 +62,48 @@ answer should be) is the most common way a task goes wrong.
   fails in every rerun although TG401's run (file order, `PYTHONHASHSEED=0`)
   passed, and lists each flipped test with the runs and seeds of each outcome
   and one command that repeats the first failing rerun.
+- **A content-hash result cache** (`cache.py`). Before running the gates on a
+  task, `taskgate check` computes a key from the task's content (sorted
+  relative POSIX paths, file bytes, permission bits including the executable
+  bit, symlink targets; never mtimes or walk order; tool caches such as
+  `__pycache__/`, `*.pyc`, `.DS_Store` and `.taskgate/` left out; in diff mode
+  also git's list of the task's tracked files), the TaskGate build (version plus
+  a digest of its own source), the gates, the effective `taskgate.toml`, the
+  runner and the task's path. A hit replays the stored results and the report
+  marks the task `(cached)`. Only results without a blocking failure are stored,
+  so a failing task is always checked again. Entries live in `.taskgate/cache`
+  under the repository root (or the `--all` directory), one JSON file per key,
+  written atomically (temp file, `fsync`, `os.replace`) under an `flock` on
+  `.taskgate/cache/lock`; the directory carries a `.gitignore` of `*`, so
+  `git status` stays clean. `--no-cache` bypasses it, `--cache-dir` (or
+  `TASKGATE_CACHE_DIR`) moves it, and a cache that cannot be written is a note
+  on stderr, never a failed check. `make demo` ends by checking the good pull
+  request again:
+
+  ```
+  == taskgate check on pr/1-integer-determinant again (unchanged, expected from the cache)
+  taskgate 0.1.0: diff against main (merge base b26918e), 1 changed task, 1 other file, local runner, 1 cached
+  tasks/integer-determinant  added  PASS  (cached)
+    pass  TG101  layout-complete        layout complete
+    ...
+    pass  TG501  grader-deterministic   the grader passed all 5 reruns with identical per-test outcomes (3 tests, seeds 1-5, shuffled order)
+  result: PASS, 0 blocking failures
+  cache      .taskgate/demo/repo/.taskgate/cache
+  entries    1 (3.0 KiB): 1 usable by this taskgate build, 0 stale (taskgate cache prune removes them)
+  tasks      1 (runners: local 1)
+  lookups    1 hit, 4 misses (20% hits)
+  stored     1 result set; 3 not stored because a blocking gate failed
+  ```
+
+  `taskgate cache prune` removes entries written by another TaskGate build,
+  unreadable ones, and all but the most recently used entry per task and runner
+  (`--older-than DAYS`, `--all` and `--dry-run` widen or preview it). On a copy
+  of the sample repository after one task's `instruction.md` changed:
+
+  ```
+  $ taskgate cache prune prunedemo --dry-run
+  would remove 1 of 2 entries (3.0 KiB): 1 superseded by a newer entry for the same task and runner; 1 kept in prunedemo/.taskgate/cache
+  ```
 - **`taskgate grade TASK --seed S`** is that command: it runs the reference
   solution, then the grader exactly as TG501's rerun with seed `S` did, and
   prints pytest's output and each test's outcome in the order the tests ran
@@ -192,15 +235,18 @@ images already built).
 
 ```
 taskgate check [REPO] [--base REF] [--all] [--out DIR] [--format text|markdown|json] [--config FILE]
-               [--runner auto|docker|local]
+               [--runner auto|docker|local] [--no-cache] [--cache-dir DIR]
 taskgate grade TASK --seed N [--runner auto|docker|local] [--config FILE]
+taskgate cache stats [ROOT] [--cache-dir DIR] [--json]
+taskgate cache prune [ROOT] [--cache-dir DIR] [--older-than DAYS] [--all] [--dry-run]
 taskgate gates [ROOT] [--json] [--config FILE]
 taskgate tasks [ROOT] [--json] [--strict]
 taskgate version
 ```
 
 `make demo` builds the sample repository, checks out each pull-request branch
-and runs `taskgate check <repo> --base main --out <dir>`. On the good branch:
+and runs `taskgate check <repo> --base main --out <dir>`, then checks the good
+branch once more to show the cache hit. On the good branch:
 
 ```
 taskgate 0.1.0: diff against main (merge base b26918e), 1 changed task, 1 other file, local runner
@@ -432,7 +478,7 @@ CI appends the demo reports of both runners to the job summaries.
 flowchart LR
     PR["checked-out PR branch"] --> CH["changes.py<br/>git merge-base + diff,<br/>ls-tree task roots"]
     CH --> TASKS["changed tasks<br/>added / modified / removed"]
-    TASKS --> GATES["gates/<br/>core, lint, hygiene,<br/>environment<br/>(requires -> skip)"]
+    GATES["gates/<br/>core, lint, hygiene,<br/>environment<br/>(requires -> skip)"]
     GATES --> MAN["manifest.py<br/>schema, unknown keys"]
     GATES --> SEC["secretscan.py<br/>formats, keys, entropy"]
     GATES --> DF["dockerfile.py<br/>parse, static checks,<br/>pulled images"]
@@ -441,6 +487,9 @@ flowchart LR
     RUN --> SHUF["shuffle_plugin.py<br/>seeded test order"]
     RUN --> DOCK["docker_runner.py<br/>content-tagged image,<br/>docker run --network none"]
     RUN --> LOC["runner.py LocalRunner<br/>temp workspace (fallback)"]
+    TASKS --> CACHE["cache.py<br/>content hash + key,<br/>.taskgate/cache (flock)"]
+    CACHE -- miss --> GATES
+    CACHE -- hit --> RES
     GATES --> RES["results.py<br/>GateResult, TaskReport,<br/>CheckReport"]
     RES --> REP["report.py<br/>text / Markdown / JSON"]
     REP --> EXIT["exit 0 / 1 / 2"]
@@ -456,23 +505,26 @@ flowchart LR
 | `shuffle_plugin.py` | the pytest plugin copied into every TG501 rerun: seeded test order and a seeded `random` |
 | `determinism.py` | JUnit XML to pytest test ids and outcomes, flipped tests and how to describe them |
 | `dockerfile.py` | Dockerfile parsing, the static checks behind TG301, the pulled-image list behind TG302 |
-| `files.py` | which task paths are content (caches and `.DS_Store` are not) and a sorted walk |
+| `files.py` | which task paths are content (caches, `.DS_Store` and `.taskgate/` are not) and a sorted walk |
+| `cache.py` | the task content hash, the cache key, the atomic, locked result store, `stats` and `prune`, and `CachedChecks` (lookup before the gates, store after) |
 | `gates/` | the `Gate` protocol, `TaskContext` and `@gate` (`base.py`); layout, manifest and runtime gates (`core.py`); manifest and instruction lint (`lint.py`); secrets, sizes and binaries (`hygiene.py`); build and digest pins (`environment.py`); grader determinism (`determinism.py`) |
 | `secretscan.py` | the credential detectors behind TG201, with redacted findings |
 | `config.py` | `taskgate.toml` parsing and validation (every problem at once): gates, `[manifest]`, `[secrets]`, `[files]`, `[runner]`, `[determinism]` |
 | `registry.py` | built-in plus entry-point gates, validated and sorted by code |
 | `engine.py` | `run_gates`: runs gates in code order, skips unmet `requires`, contains gate crashes |
 | `report.py` | pure renderers from a `CheckReport` to text, Markdown and JSON |
-| `cli.py` | Typer commands `check` (with `--runner`), `grade`, `gates`, `tasks`, `version` |
+| `cli.py` | Typer commands `check` (with `--runner`, `--no-cache`, `--cache-dir`), `grade`, `cache stats`, `cache prune`, `gates`, `tasks`, `version` |
 
 ## Measured
 
 | What | Command | Result |
 | --- | --- | --- |
-| Tests and coverage | `make cov` | 389 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2422 statements, 668 branches); gate is 90% |
-| Real-Docker tests | `time make test-docker` | 5 passed in 10.1 to 10.4 s (two runs, task images already built), including TG501 in a real container finding the same flips as the local runner; also green on the GitHub Actions runner (13.1 s) |
-| Demo wall time, local runner | `time make demo` | 5.34 to 6.28 s over three runs (four pull requests; 1.95 to 2.00 s for three before TG501) |
-| Demo wall time, Docker runner | `time make demo-docker` | 8.44 to 8.68 s over two runs with the four task images built; 10.84 s on the run that built the new log-levels image |
+| Tests and coverage | `make cov` | 463 passed, 5 skipped (the opt-in real-Docker tests); 100% line and branch coverage of `src/` (2891 statements, 770 branches); gate is 90% |
+| Real-Docker tests | `time make test-docker` | 5 passed in 10.6 s (task images already built), including TG501 in a real container finding the same flips as the local runner; also green on the GitHub Actions runner (13.1 s) |
+| Demo wall time, local runner | `time make demo` | 5.72 to 5.87 s over three runs (four pull requests plus the cached re-check; 1.95 to 2.00 s for three before TG501) |
+| Demo wall time, Docker runner | `time make demo-docker` | 8.76 s on both of two runs with the four task images built |
+| Cache hit vs full check, one task | `time taskgate check <demo repo> --base main` on `pr/1-integer-determinant`, with `--no-cache` and cached (three runs each) | local runner 1.13 to 1.18 s uncached, 0.18 s cached; Docker runner 1.89 to 1.95 s uncached, 0.21 to 0.22 s cached |
+| Cache on the bundled samples | `time taskgate check --all examples/sample-repo --runner local --cache-dir DIR`, first run and three more | 1.06 to 1.10 s, then 0.10 to 0.11 s once the complete task is cached (the incomplete draft fails TG101, so it is never stored) |
 | Demo in the TaskGate image | `time docker run --rm --entrypoint sh taskgate:local examples/demo.sh /tmp/taskgate-demo` | 6.56 to 6.91 s over three runs |
 | TG501 cost | `time taskgate check --all examples/sample-repo --runner local`, with and without `[gates] disable = ["TG501"]` | 1.08 to 1.21 s with it, 0.50 to 0.56 s without (three runs each; one complete task, five grader reruns) |
 | Image sizes | `docker image ls taskgate`, `docker image ls taskgate-env` | TaskGate image 473 MB (python:3.12-slim plus git); each sample task image 235 MB |
@@ -559,6 +611,15 @@ flowchart LR
   config cannot leak in, drops `PYTEST_*` and coverage variables, sets
   `PYTHONHASHSEED=0`, and runs the grader with TaskGate's own interpreter
   (pytest is a runtime dependency for that reason).
+- **Cache what passed, keyed by everything a result depends on.** A result is
+  reused only when the task's bytes, modes, paths and symlinks, the TaskGate
+  source, the gates, the config, the runner and the task's path all match. The
+  TaskGate part is a digest of its own source, not just the version string, so
+  an edited checkout never replays results of older code. Blocking failures are
+  never stored, which keeps a transient failure (a Docker hiccup, a timeout
+  under load) from sticking; the cost is that a failing task is always
+  re-checked. Writes are atomic and serialized by a lock file, lookups need no
+  lock, and a broken cache degrades to a normal run.
 - **Byte-stable reports.** Reports hold no timings (pytest durations are stripped
   from summaries) and no absolute paths, and the demo repository has fixed
   commit metadata; a test checks that two independent builds produce identical
@@ -591,8 +652,20 @@ flowchart LR
 - The diff is taken from committed `HEAD`, while gates read the working tree;
   uncommitted edits are checked only if they sit inside a task the commits
   already touch.
-- Gates run sequentially and nothing is cached yet; every run re-executes every
-  changed task.
+- Gates run sequentially; only the cache skips work, and only for tasks whose
+  last check had no blocking failure.
+- A cached pass is replayed as long as nothing in its key changes, so a flake
+  that TG501's reruns missed once stays hidden until the task, the config or
+  TaskGate changes (`--no-cache` forces a fresh check). The key covers the task
+  directory, not what a symlink inside it points to: a symlink leading outside
+  the task makes the task uncacheable (a note on stderr), and nothing outside
+  the task directory other than the config is hashed.
+- The key includes the host's Python, pytest and platform even on the Docker
+  runner, so upgrading TaskGate's own environment misses every entry once.
+- Cache entries accumulate until `taskgate cache prune` runs; nothing prunes them
+  automatically.
+- In the TaskGate image the application directory is not writable by its user,
+  so `check --all examples/sample-repo` there prints a note and runs uncached.
 - TG501 roughly doubles the time of the runtime gates on a small task (1.1 s
   against 0.5 s on the sample repository) because it adds a solution run and
   five grader runs; on a slow grader the cost grows with it. The solution run
@@ -628,11 +701,11 @@ flowchart LR
 
 Planned in [PLAN.md](PLAN.md). Slices 1 (the gate registry, plugins,
 `taskgate.toml` and the static gates), 2 (the Docker runner, TG301, TG302 and
-TG403) and 3 (grader determinism, TG501, and `taskgate grade`) are built (see
-above); the rest is not built yet:
+TG403), 3 (grader determinism, TG501, and `taskgate grade`) and 4 (the
+content-hash result cache, `taskgate cache`) are built (see above); the rest is
+not built yet:
 
-1. A content-hash result cache so unchanged tasks are skipped on re-runs.
-2. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
+1. GitHub reporting: pull-request comment upsert, check-run annotations, JUnit
    XML, a fake GitHub API for tests and the demo, and a composite `action.yml`.
 
 ## Development
@@ -643,7 +716,7 @@ above); the rest is not built yet:
 | `make lint` | `ruff check` and `ruff format --check` |
 | `make typecheck` | `mypy --strict` on `src/` |
 | `make test` / `make cov` | pytest, and pytest with the 90% branch-coverage gate |
-| `make demo` | the offline end-to-end demo described above (local runner, four pull requests) |
+| `make demo` | the offline end-to-end demo described above (local runner, four pull requests, then a cached re-check) |
 | `make demo-docker` | the same demo on the Docker runner, then prune this project's dangling images |
 | `make test-docker` | the opt-in tests against a real Docker daemon (`TASKGATE_DOCKER_TESTS=1 uv run pytest -m docker`) |
 | `make clean-images` | remove the `taskgate-env:*` task images the Docker runner built |

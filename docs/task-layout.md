@@ -191,8 +191,8 @@ In diff mode "every file" means every file git tracks in the task at `HEAD`,
 whatever its name, so a committed `__pycache__/` file, `*.pyc`, `.DS_Store` or
 `.mypy_cache/` entry is checked like any other. With `--all` the directory is
 walked on disk instead, and the tool caches a working tree collects
-(`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `*.pyc`,
-`.DS_Store`) are left out; the local runner leaves out the same names when it
+(`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.taskgate/`,
+`*.pyc`, `.DS_Store`) are left out; the local runner leaves out the same names when it
 copies a task, so a run never uses a file those gates did not see. Symlinks are
 left out in both modes.
 
@@ -213,6 +213,31 @@ left out in both modes.
 
 Globs are matched with `fnmatch` on task-relative POSIX paths, so `*` also
 matches `/` (`tests/data/*` covers every file below `tests/data/`).
+
+## Result cache
+
+`taskgate check` skips a task whose results it already has. The key is a
+SHA-256 over:
+
+- the task: every directory, regular file and symlink under the task
+  directory by sorted relative POSIX path, with each file's bytes and permission
+  bits and each symlink's target (mtimes, owners and directory walk order do not
+  count; the tool caches listed under Hygiene, `.taskgate/` included, are left
+  out); in diff mode also the list of paths git tracks in the task, with the
+  content of each tracked file whatever its name;
+- the TaskGate build (its version and a digest of its own source files), every
+  gate's code, name, severity, summary, fix hint and `requires` with a digest of
+  its module's source, and the effective `taskgate.toml`;
+- the runner (`local` or `docker`), the Python, pytest and platform TaskGate
+  runs on, and the task's path as reports show it.
+
+Only results without a blocking failure are stored, so a failing task is checked
+again on every run. A task holding a symlink that leads outside it (or loops) is
+never cached. Entries are JSON files in `.taskgate/cache/entries/` under the
+repository root (diff mode) or the `--all` directory, written atomically under
+an exclusive lock on `.taskgate/cache/lock`. `--no-cache` bypasses the cache,
+`--cache-dir DIR` or `TASKGATE_CACHE_DIR` moves it, and `taskgate cache stats`
+and `taskgate cache prune` inspect and trim it.
 
 ## Gates (implemented)
 

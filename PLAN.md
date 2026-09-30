@@ -329,7 +329,10 @@ passes the same review gates before it is accepted.
   lists each flaky test with the runs and seeds where it flipped, so the author
   can reproduce it with one command. Tests use fixture tasks with a stable
   grader, an order-dependent grader and a hash-seed-dependent grader.
-- [ ] **4. Content-hash result cache.** A canonical task hash (sorted relative
+- [x] **4. Content-hash result cache.** Done 2026-09-30: 463 tests (plus 5
+  opt-in real-Docker tests, green locally and in CI), 100% branch coverage; a cached
+  check of one task takes 0.18 s against 1.13 to 1.18 s (local runner) and
+  0.21 s against 1.89 to 1.95 s (Docker runner). A canonical task hash (sorted relative
   POSIX paths, file bytes and executable bits, ignored files excluded, plus the
   TaskGate version and gate config) keys results stored under `.taskgate/cache`
   with atomic writes and a lock file; unchanged tasks are skipped and reported as
