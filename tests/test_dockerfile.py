@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from taskgate import dockerfile
 from taskgate.dockerfile import (
     ImageRef,
     external_images,
@@ -243,6 +244,35 @@ def test_run_mount_from_images_are_listed() -> None:
     ]
     (mount,) = [ref for ref in external_images(parse(text)) if ref.line == 2]
     assert mount.describe() == "line 2: RUN --mount from ghcr.io/astral-sh/uv"
+
+
+def test_quoted_flags_are_read_as_docker_reads_them() -> None:
+    """Docker strips the quotes of a flag word before it parses the value, so a
+    quoted ``--mount`` or ``--from`` names the same image as the bare form."""
+    text = (
+        f"FROM python:3.12-slim{PIN}\n"
+        'RUN --mount="type=bind,from=alpine:3,target=/a" ls /a\n'
+        f'COPY --from="busybox{PIN}" /bin/sh /bin/sh\n'
+        "RUN --mount='type=bind,from=nginx:1.27,target=/n' --mount=\"type=cache,target=/c\" true\n"
+        'RUN --mount=type=bind,from="quay.io/x/y:1",target=/q --mount=type=bi\\nd,from=z:1 true\n'
+        "RUN -- --mount=from=after-the-terminator true\n"
+        "USER 1000\n"
+    )
+    assert refs(text) == [
+        (1, "FROM", f"python:3.12-slim{PIN}", f"python:3.12-slim{PIN}", True),
+        (2, "RUN --mount from", "alpine:3", "alpine:3", False),
+        (3, "COPY --from", f"busybox{PIN}", f"busybox{PIN}", True),
+        (4, "RUN --mount from", "nginx:1.27", "nginx:1.27", False),
+        (5, "RUN --mount from", "quay.io/x/y:1", "quay.io/x/y:1", False),
+        (5, "RUN --mount from", "z:1", "z:1", False),
+    ]
+    assert dockerfile._flag_items("--a=\"x y\" --b='p q' --c=1\\ 2 --d rest --e") == (
+        [("a", "x y"), ("b", "p q"), ("c", "1 2"), ("d", "")],
+        "rest --e",
+    )
+    assert dockerfile._flag_items('--unterminated="x y') == ([("unterminated", "x y")], "")
+    assert dockerfile._flag_items("--a=1 -- --b=2") == ([("a", "1")], "--b=2")
+    assert dockerfile._flag_items("--a=1\\") == ([("a", "1")], "")
 
 
 def test_arg_defaults_may_use_earlier_args() -> None:

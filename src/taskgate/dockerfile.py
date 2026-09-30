@@ -53,7 +53,7 @@ DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
 VARIABLE = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::([-+])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))"
 )
-FLAG = re.compile(r"--(\S*)\s*")
+QUOTES = frozenset("\"'")
 KEYWORD_SPLIT = re.compile(r"[\t\v\f\r ]+")
 """What separates an instruction's keyword from its arguments (as in Docker's parser)."""
 GLOB_CHARS = frozenset("*?[")
@@ -223,15 +223,52 @@ def _declare_args(args: str, values: dict[str, str | None]) -> None:
         values[name] = _substitute(value, values) if equals else None
 
 
+def _flag_word(text: str, start: int) -> tuple[str, int]:
+    """The word at ``start`` with its quotes removed, and where it ends.
+
+    This follows Docker's ``extractBuilderFlags``: a ``"`` or ``'`` opens a quoted
+    run that may hold spaces, the quote characters themselves are dropped, and a
+    backslash escapes the next character (inside or outside quotes; a trailing one
+    is dropped), so
+    ``--mount="type=bind,from=x"`` is the same flag as ``--mount=type=bind,from=x``.
+    """
+    word: list[str] = []
+    quote = ""
+    pos = start
+    while pos < len(text):
+        char = text[pos]
+        if char == "\\":
+            pos += 1
+            if pos < len(text):
+                word.append(text[pos])
+        elif quote:
+            if char == quote:
+                quote = ""
+            else:
+                word.append(char)
+        elif char.isspace():
+            break
+        elif char in QUOTES:
+            quote = char
+        else:
+            word.append(char)
+        pos += 1
+    return "".join(word), pos
+
+
 def _flag_items(args: str) -> tuple[list[tuple[str, str]], str]:
-    """Leading ``--name=value`` flags in order (names lower-cased) and the rest."""
+    """Leading ``--name=value`` flags in order (names lower-cased, quotes removed) and the rest."""
     items: list[tuple[str, str]] = []
-    rest = args
-    while match := FLAG.match(rest):
-        name, _, value = match.group(1).partition("=")
+    pos = 0
+    while args.startswith("--", pos):
+        word, pos = _flag_word(args, pos)
+        while pos < len(args) and args[pos].isspace():
+            pos += 1
+        if word == "--":
+            break
+        name, _, value = word[2:].partition("=")
         items.append((name.lower(), value))
-        rest = rest[match.end() :]
-    return items, rest
+    return items, args[pos:]
 
 
 def _flags(args: str) -> tuple[dict[str, str], str]:
