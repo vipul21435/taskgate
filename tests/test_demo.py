@@ -114,6 +114,37 @@ def test_order_dependent_grader_is_blocked_by_the_determinism_gate(sample_repo: 
     ]
 
 
+def test_github_demo_posts_the_report_to_the_fake_api(sample_repo: Path, tmp_path: Path) -> None:
+    done = subprocess.run(
+        [sys.executable, str(EXAMPLES / "github_demo.py"), str(sample_repo), str(tmp_path / "out")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    lines = done.stdout.splitlines()
+    assert "comment created: https://github.example/sample/tasks/pull/4#issuecomment-1" in lines
+    assert "comment unchanged: https://github.example/sample/tasks/pull/4#issuecomment-1" in lines
+    assert (
+        "check run failure: 1 annotation in 1 request: https://github.example/sample/tasks/runs/2"
+    ) in lines
+    assert lines[-4:] == [
+        "",
+        "comment 1 starts with: <!-- taskgate:summary -->",
+        "check run 2: failure, title 'TaskGate: FAIL, 1 blocking failure'",
+        "  failure  tasks/log-levels/task.toml:1  TG501 grader-deterministic",
+    ]
+    assert (tmp_path / "out" / "github" / "pr-4" / "junit.xml").is_file()
+    report = json.loads((tmp_path / "out" / "github" / "pr-4" / "report.json").read_text())
+    assert report["pull_request"] == 4
+    assert git(sample_repo, "branch", "--show-current").strip() == "main"
+    usage = subprocess.run(
+        [sys.executable, str(EXAMPLES / "github_demo.py")], capture_output=True, text=True
+    )
+    assert usage.returncode != 0
+    assert "usage:" in usage.stderr
+
+
 def test_reports_are_byte_identical_across_builds(tmp_path: Path) -> None:
     outputs = []
     for name in ("first", "second"):

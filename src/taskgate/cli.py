@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -27,6 +28,7 @@ from taskgate.determinism import JUnitError, parse_junit
 from taskgate.docker_runner import RunnerChoice, RunnerUnavailableError, select_runner
 from taskgate.engine import run_gates
 from taskgate.gates.core import run_failure
+from taskgate.github import TOKEN_ENV, Annotation, GitHubClient, GitHubError
 from taskgate.layout import TASK_MANIFEST, TaskDir, find_tasks
 from taskgate.registry import (
     GROUPS,
@@ -36,7 +38,19 @@ from taskgate.registry import (
     group_of,
     load_registry,
 )
-from taskgate.report import describe_config, to_json, to_markdown, to_text
+from taskgate.report import (
+    CHECK_LEVELS,
+    ReportError,
+    describe_config,
+    findings,
+    from_json,
+    headline,
+    to_annotations,
+    to_json,
+    to_junit,
+    to_markdown,
+    to_text,
+)
 from taskgate.results import CheckReport, TaskReport
 from taskgate.runner import SOLUTION_ENTRY, Runner
 
@@ -100,13 +114,19 @@ class OutputFormat(StrEnum):
     TEXT = "text"
     MARKDOWN = "markdown"
     JSON = "json"
+    JUNIT = "junit"
+    ANNOTATIONS = "annotations"
 
 
-RENDERERS = {
+RENDERERS: dict[OutputFormat, Callable[[CheckReport], str]] = {
     OutputFormat.TEXT: to_text,
     OutputFormat.MARKDOWN: to_markdown,
     OutputFormat.JSON: to_json,
+    OutputFormat.JUNIT: to_junit,
+    OutputFormat.ANNOTATIONS: to_annotations,
 }
+REPORT_FILES = {"report.md": to_markdown, "report.json": to_json, "junit.xml": to_junit}
+"""What ``check --out DIR`` writes."""
 
 
 def _fail_usage(message: str) -> typer.Exit:
@@ -215,16 +235,29 @@ def _check_all(
     )
 
 
+def _pull_request_paths(pull: PullRequestSource) -> list[str]:
+    """Every path the pull request touches (both sides of a rename), from the GitHub API."""
+    if pull.repo is None:
+        raise _fail_usage("--pr needs --repo OWNER/NAME (or GITHUB_REPOSITORY)")
+    try:
+        files = GitHubClient.from_env(pull.repo).pull_request_files(pull.number)
+    except GitHubError as exc:
+        raise _fail_usage(str(exc)) from exc
+    return [path for item in files for path in (item.path, item.previous_path) if path]
+
+
 def _check_diff(
     repo: Path,
     base: str | None,
     config_path: Path | None,
     choice: RunnerChoice,
     cache: CacheSettings,
+    pull: PullRequestSource | None = None,
 ) -> CheckReport:
+    paths = None if pull is None else _pull_request_paths(pull)
     try:
         root = repo_root(repo)
-        changes = changed_tasks(root, base)
+        changes = changed_tasks(root, base, paths=paths)
     except GitError as exc:
         raise _fail_usage(str(exc)) from exc
     registry = _registry()
@@ -247,8 +280,37 @@ def _check_diff(
         other_files=changes.other_files,
         config=config.summary(),
         runner=runner.name,
+        pull_request=None if pull is None else pull.number,
     )
 
+
+@dataclass(frozen=True, slots=True)
+class PullRequestSource:
+    """``check --pr N --repo OWNER/NAME``: take the changed files from the GitHub API."""
+
+    number: int
+    repo: str | None
+
+
+RepoOption = Annotated[
+    str | None,
+    typer.Option(
+        "--repo",
+        envvar="GITHUB_REPOSITORY",
+        help="GitHub repository as OWNER/NAME (default: GITHUB_REPOSITORY).",
+    ),
+]
+
+PrefixOption = Annotated[
+    str,
+    typer.Option(
+        "--path-prefix",
+        help=(
+            "Prepended to task paths in annotations: the checked directory relative to "
+            "the repository root, when --all checked a subdirectory."
+        ),
+    ),
+]
 
 RunnerOption = Annotated[
     RunnerChoice,
@@ -325,28 +387,137 @@ def check(
         ),
     ] = False,
     cache_dir: CacheDirOption = None,
+    pr: Annotated[
+        int | None,
+        typer.Option(
+            "--pr",
+            min=1,
+            help=(
+                "Take the changed files from this pull request's file list (GitHub API, "
+                "TASKGATE_GITHUB_API and GITHUB_TOKEN) instead of git diff."
+            ),
+        ),
+    ] = None,
+    github_repo: RepoOption = None,
 ) -> None:
     """Run the review gates on the tasks a pull request changes.
 
     A task whose content, TaskGate build, gates, config and runner match an
     earlier passing run is not checked again: its results come from the cache
-    and reports mark it cached. Exits 0 when no blocking gate fails, 1 when one
-    does, and 2 on usage errors.
+    and reports mark it cached. --out writes report.md, report.json and
+    junit.xml. Exits 0 when no blocking gate fails, 1 when one does, and 2 on
+    usage errors (including a GitHub API that --pr cannot read).
     """
     cache = CacheSettings(off=no_cache, directory=cache_dir)
+    if all_tasks and pr is not None:
+        raise _fail_usage("--pr lists a pull request's files; it cannot be used with --all")
+    pull = None if pr is None else PullRequestSource(pr, github_repo)
     report = (
         _check_all(repo.resolve(), config_path, runner_choice, cache)
         if all_tasks
-        else _check_diff(repo, base, config_path, runner_choice, cache)
+        else _check_diff(repo, base, config_path, runner_choice, cache, pull)
     )
     typer.echo(RENDERERS[output_format](report), nl=False)
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
-        (out / "report.md").write_text(to_markdown(report), encoding="utf-8")
-        (out / "report.json").write_text(to_json(report), encoding="utf-8")
-        typer.echo(f"wrote {out / 'report.md'} and {out / 'report.json'}", err=True)
+        for name, render in REPORT_FILES.items():
+            (out / name).write_text(render(report), encoding="utf-8")
+        written = [str(out / name) for name in REPORT_FILES]
+        typer.echo(f"wrote {', '.join(written[:-1])} and {written[-1]}", err=True)
     if not report.passed:
         raise typer.Exit(1)
+
+
+def _load_report(path: Path) -> CheckReport:
+    try:
+        return from_json(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise _fail_usage(f"cannot read {path}: {exc.strerror or exc}") from exc
+    except ReportError as exc:
+        raise _fail_usage(f"{path}: {exc}") from exc
+
+
+ReportArgument = Annotated[
+    Path, typer.Argument(help="A report.json written by taskgate check --out.")
+]
+
+
+@app.command("report")
+def report_command(
+    report_json: ReportArgument,
+    output_format: Annotated[
+        OutputFormat, typer.Option("--format", help="What to print on stdout.")
+    ] = OutputFormat.MARKDOWN,
+    prefix: PrefixOption = "",
+) -> None:
+    """Print a saved report.json in another format (annotations for a CI log, JUnit XML...)."""
+    report = _load_report(report_json)
+    if output_format is OutputFormat.ANNOTATIONS:
+        typer.echo(to_annotations(report, prefix), nl=False)
+    else:
+        typer.echo(RENDERERS[output_format](report), nl=False)
+
+
+@app.command()
+def publish(
+    report_json: ReportArgument,
+    pr: Annotated[int, typer.Option("--pr", min=1, help="Pull request number.")],
+    github_repo: RepoOption = None,
+    sha: Annotated[
+        str | None,
+        typer.Option("--sha", help="Commit the check run belongs to (the pull request's head)."),
+    ] = None,
+    comment: Annotated[
+        bool, typer.Option("--comment/--no-comment", help="Create or update the summary comment.")
+    ] = True,
+    check_run: Annotated[
+        bool,
+        typer.Option("--check-run/--no-check-run", help="Create a check run with annotations."),
+    ] = True,
+    check_name: Annotated[str, typer.Option("--check-name", help="Check run name.")] = "TaskGate",
+    prefix: PrefixOption = "",
+) -> None:
+    """Post a report.json to a pull request: one summary comment, kept up to date, and a
+    check run with an annotation per failed gate (sent 50 per request).
+
+    The API base URL comes from TASKGATE_GITHUB_API (default https://api.github.com)
+    and the token from GITHUB_TOKEN. Exits 0 when everything was posted, 1 when the
+    API refused or could not be reached, and 2 on usage errors. The gates' verdict
+    does not change the exit code: check reports that.
+    """
+    report = _load_report(report_json)
+    if github_repo is None:
+        raise _fail_usage("--repo OWNER/NAME (or GITHUB_REPOSITORY) is required")
+    if check_run and not sha:
+        raise _fail_usage("--sha is required for a check run (or pass --no-check-run)")
+    if not os.environ.get(TOKEN_ENV):
+        raise _fail_usage(f"{TOKEN_ENV} is not set; publish needs a token")
+    try:
+        client = GitHubClient.from_env(github_repo)
+        if comment:
+            posted = client.upsert_comment(pr, to_markdown(report))
+            typer.echo(f"comment {posted.action}: {posted.url}")
+        if check_run:
+            annotations = [
+                Annotation(f.path, CHECK_LEVELS[f.severity], f.title, f.message, f.details)
+                for f in findings(report, prefix)
+            ]
+            run = client.create_check_run(
+                name=check_name,
+                head_sha=sha or "",
+                conclusion="success" if report.passed else "failure",
+                title=headline(report),
+                summary=to_markdown(report),
+                annotations=annotations,
+            )
+            typer.echo(
+                f"check run {'success' if report.passed else 'failure'}: "
+                f"{_count(run.annotations, 'annotation')} in {_count(run.requests, 'request')}: "
+                f"{run.url}"
+            )
+    except GitHubError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 GRADE_NEEDS = (f"solution/{SOLUTION_ENTRY}", "tests/")

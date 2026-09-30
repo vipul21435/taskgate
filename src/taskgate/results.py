@@ -113,6 +113,9 @@ class CheckReport:
     runner: str = "local"
     """Where solutions and graders ran: ``local`` or ``docker``."""
 
+    pull_request: int | None = None
+    """The pull request whose file list (from the GitHub API) replaced ``git diff``."""
+
     @property
     def blocking_failures(self) -> int:
         return sum(task.blocking_failures for task in self.tasks)

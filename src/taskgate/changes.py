@@ -141,13 +141,26 @@ def owning_task(path: str, roots: frozenset[PurePosixPath]) -> PurePosixPath | N
     return None
 
 
-def changed_tasks(repo: Path, base: str | None = None, head: str = "HEAD") -> ChangeSet:
-    """Diff ``head`` against its merge base with ``base`` and group the paths by task."""
+def changed_tasks(
+    repo: Path,
+    base: str | None = None,
+    head: str = "HEAD",
+    paths: Iterable[str] | None = None,
+) -> ChangeSet:
+    """Diff ``head`` against its merge base with ``base`` and group the paths by task.
+
+    ``paths``, when given, replaces the ``git diff`` (a pull request's file list
+    from the GitHub API); task roots still come from git at ``head`` and at the
+    merge base.
+    """
     base_ref = resolve_base(repo, base)
     if not _ref_exists(repo, head):
         raise GitError(f"head ref not found: {head}")
     merge_base = git(repo, "merge-base", base_ref, head).strip()
-    changed = _split_z(git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head))
+    if paths is None:
+        changed = _split_z(git(repo, "diff", "--name-only", "-z", "--no-renames", merge_base, head))
+    else:
+        changed = sorted(set(paths))
     head_files = tracked_files(repo, head)
     head_roots = task_roots(head_files)
     base_roots = task_roots(tracked_files(repo, merge_base))

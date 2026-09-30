@@ -2,8 +2,10 @@
 # Offline end-to-end demo: build the sample repository, then run `taskgate check`
 # on each pull-request branch the way CI would (branch checked out, diff against
 # main). The good pull request must exit 0 and each of the three flawed ones 1.
-# Finally the good branch is checked again: its task is unchanged, so its
-# results must come from the result cache (.taskgate/cache in the repository).
+# Then the good branch is checked again: its task is unchanged, so its results
+# must come from the result cache (.taskgate/cache in the repository). Finally
+# github_demo.py checks the fourth pull request with its file list taken from an
+# in-process fake of the GitHub API and publishes the report to it.
 #
 # Usage: sh examples/demo.sh [WORKDIR]   (default: $TMPDIR/taskgate-demo)
 #
@@ -55,6 +57,11 @@ taskgate cache stats "$repo"
 git -C "$repo" checkout -q main
 
 echo
+echo "== GitHub reporting against the in-process fake API (pull request 4)"
+python "$here/github_demo.py" "$repo" "$work/out"
+
+echo
 echo "demo ok: the good pull request passed, all three flawed ones were blocked,"
-echo "and the unchanged task was not checked a second time"
+echo "the unchanged task was not checked a second time, and the fourth pull request's"
+echo "report was posted to the fake GitHub API as one comment and one check run"
 echo "reports: $work/out"
