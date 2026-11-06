@@ -968,6 +968,16 @@ and GitHub reporting with the composite action. Not started, and not promised:
 | `make docker` | build the image, run the demo in it, prune this project's dangling images |
 | `uv run python examples/secret_survey.py scan DIR` / `recall` / `timing` | the secret-scan false-positive, recall and long-line timing measurements above |
 
+## Related tools
+
+- [taskledger](https://github.com/vipul21435/taskledger): schema-checked task bundles, review lint rules, a canonical content hash and near-duplicate detection with MinHash and LSH.
+- [graderguard](https://github.com/vipul21435/graderguard): audit the grader of a benchmark task for AI coding agents for reward hacking before the task ships.
+- [reporewind](https://github.com/vipul21435/reporewind): rebuild a Python repository at a historical commit inside a Docker image on a digest-pinned base, to prove a fix commit flips its tests from failing to passing.
+- [testlogs](https://github.com/vipul21435/testlogs): parse pytest, JUnit XML and TAP output into per-test results, and diff two runs.
+- [issuelint](https://github.com/vipul21435/issuelint): check issue-to-fix task records for solution leaks, test leaks, location hints, underspecification and scope gaps.
+
+The full list is on the author's profile: https://github.com/vipul21435
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
